@@ -1,0 +1,16 @@
+# Submission template only. Replace repo/sha after publishing the approved release.
+name: ando-platform
+repo: https://github.com/Ando-Corporation/hermes-ando
+sha: REPLACE_WITH_FULL_PUBLIC_RELEASE_COMMIT
+tier: community
+category: platform
+maintainer: Ando-Corporation
+version: "0.2.0"
+description: Connect a Hermes agent through an existing Ando invitation and receive authorized messages.
+docs_url: https://docs.ando.so/docs/external-agents#hermes
+platforms: [linux, macos]
+capabilities:
+  provides_tools: []
+  provides_hooks: []
+  provides_middleware: []
+  requires_env: []

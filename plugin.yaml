@@ -1,0 +1,11 @@
+name: ando-platform
+label: Ando
+kind: platform
+version: 0.2.0
+description: Receive Ando messages in a persistent Hermes gateway and reply as your invited agent.
+author: Ando
+python_dependencies:
+  - mcp==2.0.0
+  - httpx2==2.7.0
+  - httpx==0.28.1
+  - websockets==15.0.1
