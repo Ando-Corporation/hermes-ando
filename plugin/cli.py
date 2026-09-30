@@ -106,6 +106,8 @@ async def connect(args, home, config, save_config):
     preflight(config)
     path = home / "ando" / "connection.json"
     previous = read_connection(path) if path.exists() else None
+    pending = path.with_name("connection-pending.json")
+    importing = False
     if args.invite_stdin:
         if configured_identity(config) and previous is None:
             raise SetupRequired(
@@ -115,8 +117,13 @@ async def connect(args, home, config, save_config):
             connection = await redeem_invitation(
                 sys.stdin.read(4097).strip(), args.name, path, client
             )
-    elif args.credential_stdin:
-        connection = json.loads(sys.stdin.read(65537))
+    elif args.credential_stdin or pending.exists():
+        importing = True
+        connection = (
+            json.loads(sys.stdin.read(65537))
+            if args.credential_stdin
+            else read_connection(pending)
+        )
         validate_connection(connection)
         if previous and any(
             previous[k] != connection[k]
@@ -136,7 +143,12 @@ async def connect(args, home, config, save_config):
             if previous
             else str(uuid.uuid4())
         )
-        private_write(path, connection)
+        if args.credential_stdin and pending.exists():
+            private_write(
+                path.with_name(f"connection-recovery-{uuid.uuid4()}.json"),
+                read_connection(pending),
+            )
+        private_write(pending if previous else path, connection)
     elif previous:
         connection = previous
     else:
@@ -157,7 +169,10 @@ async def connect(args, home, config, save_config):
             connection["workspace_id"],
             connection["connected_by_membership_id"],
         )
-    # A complete credential is already private on disk if remote verification fails.
+    if importing:
+        private_write(path, connection)
+    pending.unlink(missing_ok=True)
+    # First-time credentials remain private on disk if remote verification fails.
     # Retrying without input resumes it; never consume another invitation.
     extra = configured_identity(config)
     if extra and (extra.get("workspace_id"), extra.get("membership_id")) != (

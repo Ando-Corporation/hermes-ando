@@ -100,3 +100,13 @@ separate release gate.
 Keep the existing identity and profile. The previous OAuth setup helper remains
 available for recovery; see [LEGACY-OAUTH.md](LEGACY-OAUTH.md). New users follow
 the invitation instructions above.
+
+### Interrupted credential replacement
+
+A reconnect import keeps the verified connection until the replacement passes
+identity checks. The replacement is stored privately in
+`$HERMES_HOME/ando/connection-pending.json`; plain `hermes ando connect` retries it.
+Importing another replacement preserves the earlier pending response in a private
+`connection-recovery-<uuid>.json` file in the same directory. To retry that response,
+feed that file to `hermes ando connect --credential-stdin`. A successful connection
+clears the pending file. Recovery copies remain private for operator review.
