@@ -1,11 +1,12 @@
 {
   "version": "0.2.0",
-  "ando_commit": "c5589e0e6b4679bf2a094adb3519fa06f392b966",
+  "ando_commit": "c7e6a4356af12317d3e100a22c19a728f4746b32",
   "source_dirty": false,
-  "license_supplied": false,
+  "license_supplied": true,
   "sha256": {
     ".gitignore": "4cad133d4f0a6cf4bba15f1b8bbae48d6a55f20b94f75487c51a93cc6a5af59f",
     "LEGACY-OAUTH.md": "462069016cc68d142b86cc909f15d458ccdc534e6603c21e3463be66ae1aab05",
+    "LICENSE": "85f93f84b67a24fe34198e86bd3cddb91ee070509d8b065a8c5da1c4eedae0e2",
     "README.md": "a44b40d1d95e2d372131f1bf83a79ab721c8a2dccd365ea5ca3dcc13bbd3a9fb",
     "RELEASING.md": "0cd938f56a499fdacbd9e58b92db04ecdb9030ad2ad461ac3fa1f900d7f4bb9b",
     "__init__.py": "b23e53da608eb236440eb8c04be86dc033a6bd5eb2f19c3c615174a624aa24c4",
