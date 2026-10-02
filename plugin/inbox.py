@@ -163,6 +163,13 @@ class InboxRecovery:
         disabled = await self.delivery.preferences()
         if {"get_message", "list_conversations"} & disabled:
             raise SetupRequired("Ando message reading is disabled in Settings > Members")
+        recovery = item.get("recovery")
+        if not recovery or recovery.get("tool") != "get_messages_by_time_range":
+            # Revoked/inaccessible activity can have no recoverable context.
+            # Retire that row without trying to read its unavailable source.
+            await self.acknowledge(current_item, "read", revision)
+            state.set(pending_key, "")
+            return
         response = await self.transport.call(
             "get_message", {"message_id": item["message_id"]}
         )
