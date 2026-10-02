@@ -197,3 +197,44 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             args for name, args in self.transport.calls if name == "reply_to_message"
         ]
         self.assertEqual(sends[0]["message_id"], "root")
+
+    async def test_thread_mention_uses_source_root_when_group_has_no_root(self):
+        original = self.transport.call
+
+        async def threaded(name, args):
+            result = await original(name, args)
+            if name == "get_message" and args["message_id"] == "message-2":
+                result["data"]["thread_root_id"] = "root"
+            if name == "get_messages_by_time_range":
+                for message in result["items"]:
+                    if message["id"] == "message-2":
+                        message["thread_root_message_id"] = "root"
+            return result
+
+        self.transport.call = threaded
+        await self.inbox.handle({**ITEM, "type": "mention"})
+        self.assertIn('"id": "root"', self.turns[0]["content"])
+        self.assertIn("request 2", self.turns[0]["content"])
+        self.assertNotIn("request 1", self.turns[0]["content"])
+        self.assertFalse(self.state.completed("message:message-1"))
+        sends = [(name, args) for name, args in self.transport.calls
+                 if name in {"send_message", "reply_to_message"}]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0][0], "reply_to_message")
+        self.assertEqual(sends[0][1]["message_id"], "root")
+
+    async def test_unrecoverable_item_is_read_without_fetching_inaccessible_source(self):
+        original = self.transport.call
+
+        async def inaccessible(name, args):
+            if name == "get_message":
+                raise PermissionError("conversation access revoked")
+            return await original(name, args)
+
+        self.transport.call = inaccessible
+        await self.inbox.handle({**ITEM, "recovery": None})
+        self.assertEqual(self.turns, [])
+        self.assertEqual(self.state.get("pending:inbox-1"), "")
+        acknowledgements = [args["state"] for name, args in self.transport.calls
+                            if name == "acknowledge_agent_inbox_item"]
+        self.assertEqual(acknowledgements, ["in_progress", "read"])
