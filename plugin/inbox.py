@@ -163,15 +163,29 @@ class InboxRecovery:
         disabled = await self.delivery.preferences()
         if {"get_message", "list_conversations"} & disabled:
             raise SetupRequired("Ando message reading is disabled in Settings > Members")
+        response = await self.transport.call(
+            "get_message", {"message_id": item["message_id"]}
+        )
+        message = response.get("data", response)
+        if (
+            message.get("id") != item["message_id"]
+            or message.get("conversation_id") != item["conversation_id"]
+        ):
+            raise SetupRequired("Ando returned a different source message")
+        # Mention inbox rows group activity across a conversation. Their thread
+        # field can be empty even when the latest source message is a reply.
+        # The source message owns the reply destination and history boundary.
+        item = {
+            **item,
+            "thread_root_message_id": message.get(
+                "thread_root_id", item.get("thread_root_message_id")
+            ),
+        }
         messages = await self.history(item)
         if messages is None:
             await self.acknowledge(current_item, "read", revision)
             state.set(pending_key, "")
             return
-        response = await self.transport.call(
-            "get_message", {"message_id": item["message_id"]}
-        )
-        message = response.get("data", response)
         covered_key = f"covered:{key}"
         frozen = state.get(covered_key)
         if frozen is None:
