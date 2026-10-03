@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import logging
+import os
 from pathlib import Path
 
 from gateway.config import Platform
@@ -16,6 +17,19 @@ from .state import DeliveryState
 from .transport import AndoTransport, listen
 
 logger = logging.getLogger(__name__)
+
+
+def local_allowed_users(extra):
+    """Explicit operator policy; old invitation profiles also default private."""
+    if os.getenv("ANDO_ALLOW_ALL_USERS", "").lower() in {"1", "true", "yes"}:
+        return ["*"]
+    if "ANDO_ALLOWED_USERS" in os.environ:
+        return [value.strip() for value in os.environ["ANDO_ALLOWED_USERS"].split(",")
+                if value.strip()]
+    values = extra.get("allowed_users", [extra.get("installer_id")])
+    if not isinstance(values, list) or any(not isinstance(v, str) or not v for v in values):
+        raise SetupRequired("Ando allowed_users must be a list of membership IDs")
+    return values
 
 
 def validate_config(config):
@@ -151,9 +165,10 @@ class AndoAdapter(BasePlatformAdapter):
                         self._state,
                         self.extra["workspace_id"],
                         self.extra["membership_id"],
-                        None if invited else self.extra["allowed_users"],
+                        local_allowed_users(self.extra),
                         self._dispatch,
-                        None if invited else self.extra["allowed_conversations"],
+                        self.extra.get("allowed_conversations"),
+                        credential_mode=self.extra.get("credential_mode"),
                     )
                     from .inbox import InboxRecovery
 
@@ -220,7 +235,10 @@ class AndoAdapter(BasePlatformAdapter):
             thread_id=ref["thread_id"],
             scope_id=self.extra["workspace_id"],
             message_id=ref["message_id"],
-            role_authorized=True,
+            role_authorized=(
+                ref["author_id"] in local_allowed_users(self.extra)
+                or "*" in local_allowed_users(self.extra)
+            ),
         )
         event = MessageEvent(
             text=message.get("content")
@@ -311,6 +329,8 @@ def register(ctx):
         check_fn=check_requirements,
         validate_config=validate_config,
         install_hint="Install the plugin dependencies, then run hermes ando connect using the existing invitation.",
+        allowed_users_env="ANDO_ALLOWED_USERS",
+        allow_all_env="ANDO_ALLOW_ALL_USERS",
         max_message_length=0,
         platform_hint="Ando delivers authorized messages; the platform posts your final reply automatically.",
     )

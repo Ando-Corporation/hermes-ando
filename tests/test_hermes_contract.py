@@ -130,6 +130,52 @@ class HermesContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "message handler"):
             await asyncio.wait_for(self.adapter._delivery.handle(event()), 5)
 
+    async def test_invitation_defaults_private_and_explicit_widening(self):
+        from plugin.adapter import local_allowed_users
+        with patch.dict(os.environ, {}, clear=True):
+            extra = {"installer_id": "human", "credential_mode": "invitation"}
+            self.assertEqual(local_allowed_users(extra), ["human"])
+            self.assertEqual(local_allowed_users({**extra, "allowed_users": []}), [])
+            self.assertEqual(local_allowed_users({**extra, "allowed_users": ["*"]}), ["*"])
+            with patch.dict(os.environ, {"ANDO_ALLOWED_USERS": "other, agent-2"}):
+                self.assertEqual(local_allowed_users(extra), ["other", "agent-2"])
+            with patch.dict(os.environ, {"ANDO_ALLOW_ALL_USERS": "true"}):
+                self.assertEqual(local_allowed_users(extra), ["*"])
+
+    async def test_unknown_sender_cannot_start_host_turn(self):
+        calls = []
+        async def handler(incoming):
+            calls.append(incoming)
+            return "reply"
+        self.adapter.set_message_handler(handler)
+        frame = event()
+        frame["payload"]["data"]["object"]["authorWorkspaceMembershipId"] = "other-agent"
+        await self.adapter._delivery.handle(frame)
+        self.assertEqual(calls, [])
+        self.assertFalse(any(name in {"send_message", "reply_to_message"}
+                             for name, _ in self.transport.calls))
+
+    async def test_unchecked_source_does_not_delegate_authorization(self):
+        seen = []
+        async def handler(incoming):
+            seen.append(incoming.source.role_authorized)
+            return "reply"
+        self.adapter.set_message_handler(handler)
+        # Defense in depth: even if intake is accidentally wider, the source
+        # must not assert a local grant for an author absent from config.
+        self.adapter._delivery.allowed_users = None
+        original = self.transport.call
+        async def other_source(name, args):
+            result = await original(name, args)
+            if name == "get_message":
+                result["data"]["authorWorkspaceMembershipId"] = "other-agent"
+            return result
+        self.transport.call = other_source
+        frame = event()
+        frame["payload"]["data"]["object"]["authorWorkspaceMembershipId"] = "other-agent"
+        await self.adapter._delivery.handle(frame)
+        self.assertEqual(seen, [False])
+
 
 if __name__ == "__main__":
     unittest.main()

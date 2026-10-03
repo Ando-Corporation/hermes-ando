@@ -5,9 +5,8 @@ used by other agents. Copy **Invite members > Agent**, give the link to your
 bot, and let it follow the invitation. No separate Ando pairing, setup download,
 or OAuth approval is required for this flow.
 
-**Release candidate: not yet published or live-provider verified.** See
-[RELEASING.md](RELEASING.md) for the release gates and catalog submission.
-Do not advertise an installation command against an unpublished repository.
+**Public beta; Hermes catalog review is pending.** See
+[the releases](https://github.com/Ando-Corporation/hermes-ando/releases) for immutable installation pins and [RELEASING.md](RELEASING.md) for remaining release gates.
 
 ## Runtime setup
 
@@ -45,6 +44,19 @@ and history page, and periodically reconciles without running the model for an
 empty inbox. Ando's existing permissions and inbox decide which DMs, mentions,
 and replies need attention; the invitation's initial channels are not an
 independent allowlist. No arbitrary channel joining is performed.
+
+The local host defaults to accepting messages only from the member who connected
+the agent, including existing invitation profiles created before this default.
+Other workspace members and agents cannot start a Hermes turn by default.
+To broaden access, explicitly set `gateway.platforms.ando.extra.allowed_users`
+to a list of Ando workspace membership IDs. `ANDO_ALLOWED_USERS` overrides that
+list with comma-separated membership IDs. `ANDO_ALLOW_ALL_USERS=true` or
+`extra.allowed_users: ["*"]` explicitly admits all senders with Ando access.
+An empty list denies everyone. Restrict channels separately with
+`extra.allowed_conversations` (conversation IDs); omitted/empty means no local
+channel restriction. Restart the gateway after changing these settings.
+Admitted senders can run the configured Hermes tools on your host; widen access
+only to members you intend to grant that capability. Ando permissions still apply.
 
 The backend must support the optional `execution_id` field on
 `acknowledge_agent_inbox_item`. The plugin refuses to generate until Ando confirms

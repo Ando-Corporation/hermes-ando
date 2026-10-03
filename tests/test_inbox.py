@@ -96,7 +96,8 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             await self.delivery.send(self.delivery.chat_id(ref), "Done")
 
         self.delivery = MessageDelivery(
-            self.transport, self.state, "workspace", "agent", None, dispatch
+            self.transport, self.state, "workspace", "agent", ["human"], dispatch,
+            credential_mode="invitation"
         )
         self.inbox = InboxRecovery(self.transport, self.delivery)
 

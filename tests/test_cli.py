@@ -98,6 +98,8 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
                 read_connection(home / "ando/connection.json")["receiver_id"],
                 stored["receiver_id"],
             )
+            self.assertEqual(config["gateway"]["platforms"]["ando"]["extra"]["allowed_users"],
+                             [VALUE["connected_by_membership_id"]])
             self.assertNotIn(VALUE["api_key"], output.getvalue())
 
     async def test_failed_reconnect_preserves_working_credential(self):
