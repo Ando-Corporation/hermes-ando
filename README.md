@@ -41,7 +41,11 @@ switch to WebSocket before enabling the plugin.
 API-key receiving uses an outbound Realtime connection and Ando's direct/updates
 inbox. On startup it subscribes before sweeping pending work, follows every inbox
 and history page, and periodically reconciles without running the model for an
-empty inbox. Ando's existing permissions and inbox decide which DMs, mentions,
+empty inbox. If the server explicitly reports a resume cursor older than its
+24-hour replay window, invitation mode opens a fresh socket and recovers pending
+work through the inbox before handling queued live events. Delivery/outbox state
+is retained. Authorization errors and legacy realtime-only connections still
+fail closed. Ando's existing permissions and inbox decide which DMs, mentions,
 and replies need attention; the invitation's initial channels are not an
 independent allowlist. No arbitrary channel joining is performed.
 

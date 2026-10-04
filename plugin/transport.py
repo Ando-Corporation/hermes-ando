@@ -12,6 +12,10 @@ import json
 from .protocol import PROTOCOL, SetupRequired, resource_origin, verify_ticket
 
 
+class ReplayExpired(SetupRequired):
+    """The server explicitly rejected only the realtime replay checkpoint."""
+
+
 def configured_server(name):
     from hermes_cli.config import load_config
 
@@ -164,6 +168,16 @@ class AndoTransport:
             if self.connection
             else None,
         )
+        if cursor and response.status_code == 400:
+            error = response.json().get("error", {})
+            if (
+                isinstance(error, dict)
+                and error.get("code") == "invalid_request"
+                and error.get("message", "").startswith(
+                    "Realtime resume cursor is outside the 24-hour replay window."
+                )
+            ):
+                raise ReplayExpired("Ando realtime replay window expired")
         if response.status_code in {400, 401, 403, 404}:
             raise SetupRequired(
                 "Ando realtime authorization or replay was rejected. Reconnect explicitly; no messages were skipped."
@@ -236,7 +250,15 @@ async def receive_socket(socket, state, on_event):
 async def listen(transport, state, on_event, on_connected, recover=None):
     from websockets.asyncio.client import connect
 
-    ticket = await transport.ticket(state.get("cursor"))
+    try:
+        ticket = await transport.ticket(state.get("cursor"))
+    except ReplayExpired:
+        if recover is None or transport.connection is None:
+            # Legacy realtime-only receivers have no authoritative inbox sweep.
+            raise
+        # Invitation inbox claims/history remain the authority for pending work.
+        # Subscribe first, then sweep; do not discard delivery/outbox state.
+        ticket = await transport.ticket(None)
     # The ticket floor is an authoritative initial checkpoint, not an event cursor.
     state.set("cursor", ticket["resume_cursor"])
     async with connect(

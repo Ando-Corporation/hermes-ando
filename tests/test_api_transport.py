@@ -91,3 +91,74 @@ class ApiTransportTests(unittest.IsolatedAsyncioTestCase):
                 await transport.ticket(None)
         self.assertTrue(any("/v1/realtime/connections" in url for url in seen))
         self.assertFalse(any("oauth" in url for url in seen))
+
+
+class ReplayRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_expired_replay_subscribes_before_inbox_recovery(self):
+        from plugin.transport import ReplayExpired, listen
+        from unittest.mock import AsyncMock, MagicMock
+        calls = []
+        async def ticket(cursor):
+            calls.append(cursor)
+            if cursor:
+                raise ReplayExpired("expired")
+            return {"url": "wss://example.invalid", "resume_cursor": "fresh"}
+        transport = MagicMock(connection={"credential_mode": "invitation"})
+        transport.ticket = ticket
+        state = MagicMock()
+        state.get.return_value = "old"
+        socket = MagicMock(subprotocol="ando.realtime.v1")
+        socket.__aiter__.return_value = iter([])
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=socket)
+        context.__aexit__ = AsyncMock(return_value=False)
+        order = []
+        async def recover():
+            order.append("recover")
+        with patch("websockets.asyncio.client.connect", return_value=context):
+            await listen(transport, state, AsyncMock(), lambda: order.append("connected"), recover)
+        self.assertEqual(calls, ["old", None])
+        self.assertEqual(order, ["connected", "recover"])
+        state.set.assert_called_once_with("cursor", "fresh")
+
+    async def test_no_inbox_or_no_invitation_does_not_skip_expired_replay(self):
+        from plugin.transport import ReplayExpired, listen
+        from unittest.mock import AsyncMock, MagicMock
+        for connection, recover in [({}, None), (None, AsyncMock())]:
+            transport = MagicMock(connection=connection)
+            transport.ticket = AsyncMock(side_effect=ReplayExpired("expired"))
+            state = MagicMock()
+            with self.assertRaises(ReplayExpired):
+                await listen(transport, state, AsyncMock(), lambda: None, recover)
+            self.assertEqual(transport.ticket.await_count, 1)
+            state.set.assert_not_called()
+
+    async def test_authorization_failure_never_retries_without_cursor(self):
+        from plugin.transport import listen
+        from plugin.protocol import SetupRequired
+        from unittest.mock import AsyncMock, MagicMock
+        transport = MagicMock(connection={})
+        transport.ticket = AsyncMock(side_effect=SetupRequired("revoked"))
+        state = MagicMock()
+        with self.assertRaises(SetupRequired):
+            await listen(transport, state, AsyncMock(), lambda: None, AsyncMock())
+        self.assertEqual(transport.ticket.await_count, 1)
+        state.set.assert_not_called()
+
+    async def test_only_explicit_server_replay_expiry_is_classified(self):
+        from plugin.transport import AndoTransport, ReplayExpired
+        from plugin.protocol import SetupRequired
+        from unittest.mock import AsyncMock, MagicMock
+        transport = AndoTransport(None, VALUE["agent_membership_id"], connection=VALUE)
+        response = MagicMock(status_code=400)
+        response.json.return_value = {"error": {"code": "invalid_request", "message":
+            "Realtime resume cursor is outside the 24-hour replay window. Reconnect without resume_from."}}
+        transport.http = MagicMock(post=AsyncMock(return_value=response))
+        with self.assertRaises(ReplayExpired):
+            await transport.ticket("old")
+        for status, message in [(401, "revoked"), (400, "invalid subscription")]:
+            response.status_code = status
+            response.json.return_value = {"error": {"code": "invalid_request", "message": message}}
+            with self.assertRaises(SetupRequired) as result:
+                await transport.ticket("old")
+            self.assertNotIsInstance(result.exception, ReplayExpired)
