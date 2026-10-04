@@ -115,7 +115,7 @@ class ReplayRecoveryTests(unittest.IsolatedAsyncioTestCase):
         order = []
         async def recover():
             order.append("recover")
-        with patch("websockets.asyncio.client.connect", return_value=context):
+        with patch("plugin.transport.websocket_connect", return_value=context):
             await listen(transport, state, AsyncMock(), lambda: order.append("connected"), recover)
         self.assertEqual(calls, ["old", None])
         self.assertEqual(order, ["connected", "recover"])
@@ -159,6 +159,22 @@ class ReplayRecoveryTests(unittest.IsolatedAsyncioTestCase):
         for status, message in [(401, "revoked"), (400, "invalid subscription")]:
             response.status_code = status
             response.json.return_value = {"error": {"code": "invalid_request", "message": message}}
+            with self.assertRaises(SetupRequired) as result:
+                await transport.ticket("old")
+            self.assertNotIsInstance(result.exception, ReplayExpired)
+
+    async def test_malformed_replay_error_keeps_explicit_stop(self):
+        from plugin.transport import AndoTransport, ReplayExpired
+        from plugin.protocol import SetupRequired
+        from unittest.mock import AsyncMock, MagicMock
+        transport = AndoTransport(None, VALUE["agent_membership_id"], connection=VALUE)
+        for body in [None, [], {"error": None}, {"error": {"message": None}}, ValueError("non-JSON")]:
+            response = MagicMock(status_code=400)
+            if isinstance(body, Exception):
+                response.json.side_effect = body
+            else:
+                response.json.return_value = body
+            transport.http = MagicMock(post=AsyncMock(return_value=response))
             with self.assertRaises(SetupRequired) as result:
                 await transport.ticket("old")
             self.assertNotIsInstance(result.exception, ReplayExpired)

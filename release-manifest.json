@@ -1,6 +1,6 @@
 {
   "version": "0.2.0",
-  "ando_commit": "e1048430c57c21d0508ba27f012476ac3affb5e5",
+  "ando_commit": "03e926e7405366259d1229a30ef39fb375c46315",
   "source_dirty": false,
   "license_supplied": true,
   "sha256": {
@@ -20,12 +20,12 @@
     "plugin/plugin.yaml": "457603fefb4e69afd45395e5acc0fd48d2250eb19c8dbc8590ba136d116397f5",
     "plugin/protocol.py": "825abed83036785a9241dea18e258947066f09a80f29438b4ff2ef1d8f8db790",
     "plugin/state.py": "ac928eeb3dd89e4efcb6af26498d38ce7e721610a7ba8fdb2b1c00bba47cfe8c",
-    "plugin/transport.py": "8472dd503aff276bb3a3766e210d0131fd3278789cc56b00efe9397c3a1113fc",
+    "plugin/transport.py": "407e86fb3c73ef214b4a694cbfa89ad3bc4d334c5be791aa1a8d39a800ddc06f",
     "plugin.yaml": "457603fefb4e69afd45395e5acc0fd48d2250eb19c8dbc8590ba136d116397f5",
     "recover.py": "3aeb8c3f89bb0c00b8fad112ee241451edc7ea029f8d2f9c66dd98b72575fcae",
     "setup.py": "84b3511efc785fd59a147dd85d4c00a1640feff2c61fe2c4e68f5b94797e537d",
     "tests/server_fixtures.py": "7e4393d8bb6c267253235893f2a4b8133e5bec512075f20558f387375305cd7b",
-    "tests/test_api_transport.py": "1e32290a44883867d2d508635c0d30451caf03628b70ba57de2b71818e56d68f",
+    "tests/test_api_transport.py": "baf31a67bbf03a20c35419d21f7e7d13d892c934800dbeddaad516adb1044f25",
     "tests/test_cli.py": "d48bda8df222c40dd16e931e1abf826ca9d53b218fe0da03d43526f2c7b35eba",
     "tests/test_delivery.py": "f4e069ac30dc5a67ea4cb6b2bae5f83b345fcbf3b10eaa494eaa9a61ed660e69",
     "tests/test_hermes_contract.py": "9197cd6a98b6795e4ca5be5ab9a89721cd01518f9906d24a0d906753fb6ecabe",

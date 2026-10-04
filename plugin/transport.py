@@ -12,6 +12,12 @@ import json
 from .protocol import PROTOCOL, SetupRequired, resource_origin, verify_ticket
 
 
+def websocket_connect(*args, **kwargs):
+    # Keep the optional socket dependency at the actual network boundary.
+    from websockets.asyncio.client import connect
+    return connect(*args, **kwargs)
+
+
 class ReplayExpired(SetupRequired):
     """The server explicitly rejected only the realtime replay checkpoint."""
 
@@ -169,11 +175,16 @@ class AndoTransport:
             else None,
         )
         if cursor and response.status_code == 400:
-            error = response.json().get("error", {})
+            try:
+                detail = response.json()
+            except ValueError:
+                detail = None
+            error = detail.get("error") if isinstance(detail, dict) else None
             if (
                 isinstance(error, dict)
                 and error.get("code") == "invalid_request"
-                and error.get("message", "").startswith(
+                and isinstance(error.get("message"), str)
+                and error["message"].startswith(
                     "Realtime resume cursor is outside the 24-hour replay window."
                 )
             ):
@@ -248,8 +259,6 @@ async def receive_socket(socket, state, on_event):
 
 
 async def listen(transport, state, on_event, on_connected, recover=None):
-    from websockets.asyncio.client import connect
-
     try:
         ticket = await transport.ticket(state.get("cursor"))
     except ReplayExpired:
@@ -261,7 +270,7 @@ async def listen(transport, state, on_event, on_connected, recover=None):
         ticket = await transport.ticket(None)
     # The ticket floor is an authoritative initial checkpoint, not an event cursor.
     state.set("cursor", ticket["resume_cursor"])
-    async with connect(
+    async with websocket_connect(
         ticket["url"],
         subprotocols=[PROTOCOL],
         max_size=512 * 1024,
