@@ -5,7 +5,8 @@ used by other agents. Copy **Invite members > Agent**, give the link to your
 bot, and let it follow the invitation. No separate Ando pairing, setup download,
 or OAuth approval is required for this flow.
 
-**Public beta; Hermes catalog review is pending.** See
+**Public beta, listed in the Hermes community plugin catalog.** Catalog upgrades
+are reviewed SHA updates. See
 [the releases](https://github.com/Ando-Corporation/hermes-ando/releases) for immutable installation pins and [RELEASING.md](RELEASING.md) for remaining release gates.
 
 ## Runtime setup
