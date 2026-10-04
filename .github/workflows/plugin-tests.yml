@@ -1,0 +1,41 @@
+name: Plugin compatibility
+on:
+  pull_request:
+  push:
+    branches: [main, codex/thread-mention-routing]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 38d3dbce4adbb9074a34214eb330237a129e5904
+          path: .hermes-source
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install pinned Hermes runtime and plugin dependencies
+        run: python -m pip install -e .hermes-source mcp==2.0.0 httpx2==2.7.0 httpx==0.28.1 websockets==15.0.1
+      - name: Test against actual Hermes lifecycle APIs
+        env:
+          HERMES_SOURCE: ${{ github.workspace }}/.hermes-source
+        run: python -m unittest discover -s tests -v
+      - name: Verify exported file hashes
+        run: |
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          manifest = json.loads(Path('release-manifest.json').read_text())
+          for name, digest in manifest['sha256'].items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, name
+          PY
