@@ -189,6 +189,9 @@ async def connect(args, home, config, save_config):
             "workspace_id": connection["workspace_id"],
             "membership_id": connection["agent_membership_id"],
             "installer_id": connection["connected_by_membership_id"],
+            "allowed_users": (extra.get("allowed_users", [connection["connected_by_membership_id"]])
+                              if extra else [connection["connected_by_membership_id"]]),
+            "allowed_conversations": extra.get("allowed_conversations", []) if extra else [],
             "group_sessions_per_user": False,
         },
     }

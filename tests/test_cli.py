@@ -98,6 +98,8 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
                 read_connection(home / "ando/connection.json")["receiver_id"],
                 stored["receiver_id"],
             )
+            self.assertEqual(config["gateway"]["platforms"]["ando"]["extra"]["allowed_users"],
+                             [VALUE["connected_by_membership_id"]])
             self.assertNotIn(VALUE["api_key"], output.getvalue())
 
     async def test_failed_reconnect_preserves_working_credential(self):
@@ -109,29 +111,51 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
             previous = dict(VALUE, receiver_id="12345678-1234-4234-8234-123456789012")
             private_write(path, previous)
             replacement = dict(VALUE, api_key="replacement-key")
+            config = {
+                "gateway": {
+                    "platforms": {
+                        "ando": {
+                            "enabled": True,
+                            "extra": {
+                                "workspace_id": VALUE["workspace_id"],
+                                "membership_id": VALUE["agent_membership_id"],
+                                "allowed_users": [],
+                                "allowed_conversations": ["conversation-1"],
+                            },
+                        }
+                    }
+                }
+            }
+            saved = []
             args = SimpleNamespace(invite_stdin=False, credential_stdin=True, name=None)
             with (
+                patch("plugin.cli.preflight", lambda value: None),
                 patch("plugin.cli.AndoTransport", Transport),
                 patch("sys.stdin", io.StringIO(json.dumps(replacement))),
                 patch.object(Transport, "fail", True),
             ):
                 with self.assertRaises(OSError):
-                    await connect(args, home, {}, lambda value: self.fail("saved config"))
+                    await connect(args, home, config, lambda value: self.fail("saved config"))
             self.assertEqual(read_connection(path), previous)
             pending = path.with_name("connection-pending.json")
             self.assertEqual(read_connection(pending)["api_key"], replacement["api_key"])
             self.assertEqual(pending.stat().st_mode & 0o777, 0o600)
             args.credential_stdin = False
             with (
+                patch("plugin.cli.preflight", lambda value: None),
                 patch("plugin.cli.AndoTransport", Transport),
                 patch("sys.stdin", io.StringIO(json.dumps(replacement))),
                 redirect_stdout(io.StringIO()),
             ):
-                await connect(args, home, {}, lambda value: None)
+                await connect(args, home, config, lambda value: saved.append(copy.deepcopy(value)))
             stored = read_connection(path)
             self.assertFalse(pending.exists())
             self.assertEqual(stored["api_key"], replacement["api_key"])
             self.assertEqual(stored["receiver_id"], previous["receiver_id"])
+            self.assertEqual(len(saved), 1)
+            extra = saved[0]["gateway"]["platforms"]["ando"]["extra"]
+            self.assertEqual(extra["allowed_users"], [])
+            self.assertEqual(extra["allowed_conversations"], ["conversation-1"])
 
     async def test_repeated_import_retains_prior_pending_credential(self):
         import json

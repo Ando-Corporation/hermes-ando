@@ -51,7 +51,9 @@ class MessageDelivery:
         allowed_users,
         dispatch,
         allowed_conversations=None,
+        credential_mode=None,
     ):
+        self.credential_mode = credential_mode
         self.transport = transport
         self.state = state
         self.workspace_id = workspace_id
@@ -83,13 +85,14 @@ class MessageDelivery:
 
     async def handle(self, frame, history=None):
         ref = message_reference(frame, self.workspace_id, self.membership_id)
-        if ref is not None and self.allowed_users is None:
+        if ref is not None and self.credential_mode == "invitation":
             # Live and recovered deliveries must share a stable identity.
             ref["event_id"] = f"message:{ref['message_id']}"
         if ref is None or self.state.completed(ref["event_id"]):
             return
         if (
             self.allowed_users is not None
+            and "*" not in self.allowed_users
             and ref["author_id"] not in self.allowed_users
         ):
             # The adapter's explicit local allowlist can be narrower than Ando's access.

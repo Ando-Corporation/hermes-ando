@@ -269,6 +269,15 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             DeliveryState(self.path, "workspace", "another-agent")
 
+    async def test_invitation_allowlist_keeps_message_dedup_identity(self):
+        delivery = self.delivery()
+        delivery.credential_mode = "invitation"
+        await delivery.handle(event("live", "message-1"))
+        await delivery.handle(event("recovery", "message-1"))
+        self.assertEqual(self.dispatch_count, 1)
+        self.assertTrue(self.state.completed("message:message-1"))
+
+
 
 class FakeSocket:
     def __init__(self, frames):
@@ -285,6 +294,7 @@ class FakeSocket:
 
     async def send(self, text):
         self.sent.append(json.loads(text))
+
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
