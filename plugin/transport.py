@@ -8,8 +8,11 @@ secrets stay in Hermes's own manager/storage; none are copied into plugin state.
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import logging
 
 from .protocol import PROTOCOL, SetupRequired, resource_origin, verify_ticket
+
+logger = logging.getLogger(__name__)
 
 
 def websocket_connect(*args, **kwargs):
@@ -71,7 +74,7 @@ class AndoTransport:
                     async with ClientSession(
                         streams[0],
                         streams[1],
-                        client_info=Implementation(name="Ando Hermes", version="0.2.0"),
+                        client_info=Implementation(name="Ando Hermes", version="0.2.1"),
                     ) as session:
                         self.session = session
                         await session.initialize()
@@ -220,16 +223,28 @@ async def receive_socket(socket, state, on_event):
             raise SetupRequired("Malformed Ando realtime frame") from None
         kind = frame.get("type")
         if kind == "hello":
+            logger.info(
+                "Ando realtime subscribed (connection %s, %d subscription(s))",
+                frame.get("connection_id"),
+                len(frame.get("subscriptions") or []),
+            )
             continue
         if kind == "event":
             envelope = frame.get("envelope_id")
             if not isinstance(envelope, str) or not envelope:
                 raise SetupRequired("Ando event has no delivery envelope")
+            payload = frame.get("payload") or {}
+            logger.info(
+                "Ando realtime event %s (%s)", payload.get("id"), payload.get("type")
+            )
             try:
                 await on_event(frame)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                logger.warning(
+                    "Ando realtime event %s failed in the handler", payload.get("id")
+                )
                 await socket.send(
                     json.dumps(
                         {"envelope_id": envelope, "error": {"code": "handler_failed"}}
@@ -246,7 +261,13 @@ async def receive_socket(socket, state, on_event):
                 raise SetupRequired("Ando acknowledged an unknown delivery")
             pending.remove(envelope)
             state.set("cursor", frame["resume_cursor"])
+            logger.debug("Ando realtime acknowledged %s", envelope)
         elif kind == "disconnect":
+            logger.info(
+                "Ando realtime disconnect (%s, retry after %ss)",
+                frame.get("reason"),
+                frame.get("retry_after_seconds", 0),
+            )
             if isinstance(frame.get("resume_cursor"), str):
                 state.set("cursor", frame["resume_cursor"])
             if frame.get("reason") == "policy_violation":
@@ -254,7 +275,8 @@ async def receive_socket(socket, state, on_event):
             delay = frame.get("retry_after_seconds", 0)
             return min(max(float(delay), 0), 60)
         else:
-            raise SetupRequired("Unsupported Ando realtime frame")
+            raise SetupRequired(f"Unsupported Ando realtime frame type {kind!r}")
+    logger.info("Ando realtime socket closed by the server")
     return 0
 
 
@@ -280,6 +302,14 @@ async def listen(transport, state, on_event, on_connected, recover=None):
         if socket.subprotocol != PROTOCOL:
             raise SetupRequired("Ando realtime did not negotiate its protocol")
         on_connected()
+        logger.info(
+            "Ando realtime connected (connection %s, %s)",
+            ticket.get("connection_id"),
+            ", ".join(
+                f"{sub.get('delivery')}: {'/'.join(sub.get('events') or [])}"
+                for sub in ticket.get("subscriptions") or []
+            ),
+        )
         # Subscribe before sweeping: new arrivals are queued on this socket while
         # the inbox covers work from before the ticket floor. IDs deduplicate overlap.
         if recover:

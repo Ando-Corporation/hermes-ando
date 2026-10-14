@@ -5,7 +5,7 @@ sha: REPLACE_WITH_FULL_PUBLIC_RELEASE_COMMIT
 tier: community
 category: platform
 maintainer: Ando-Corporation
-version: "0.2.0"
+version: "0.2.1"
 description: Connect a Hermes agent through an existing Ando invitation and receive authorized messages.
 docs_url: https://docs.ando.so/docs/external-agents#hermes
 platforms: [linux, macos]

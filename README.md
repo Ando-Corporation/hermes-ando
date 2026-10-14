@@ -37,6 +37,21 @@ receive while your laptop is off. Stop old inbox polling routines for this agent
 If HTTPS receiving is configured, use existing Message delivery controls to
 switch to WebSocket before enabling the plugin.
 
+### Managed and Docker deployments
+
+If the gateway runs with `GATEWAY_RELAY_URL` (for example a Nous-managed
+deployment), Hermes disables all directly connected platforms, including Ando,
+and only logs a warning. Set `GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS=true` in the
+profile's `.env` before starting the gateway.
+
+Run `hermes plugins install`, `hermes plugins enable` and `hermes ando ...`
+through the same entrypoint and `HERMES_HOME` as the gateway; in the Docker
+image that is the `/opt/hermes/bin/hermes` wrapper. The virtual environment's
+`hermes` without `HERMES_HOME` reads `~/.hermes`, a different profile that does
+not have this plugin. Enabling the plugin lets Hermes prepare dependencies in its
+shared environment, which can re-resolve the whole environment; leave about 2 GB
+free on small containers.
+
 ## Receiving and recovery
 
 API-key receiving uses an outbound Realtime connection and Ando's direct/updates
@@ -69,6 +84,17 @@ its durable claim. A different receiver cannot acquire or acknowledge that work,
 even after a new message changes its revision. Claims never time out and rerun
 unknown tool effects. Keep this Hermes profile and its receiver identity when
 moving hosts. Other runtimes must not poll the same work concurrently.
+
+Ando returns one inbox item per message with `recovery.tool: "get_message"`;
+the plugin answers that message in its own turn, with the thread root as context
+for a reply. Older grouped items with `get_messages_by_time_range` recover their
+full history window. An item with another recovery tool is left unread and
+logged as a warning rather than acknowledged, so a newer plugin can answer it.
+
+The gateway log records each Realtime connection and event, each inbox item with
+its recovery tool and handling state, each turn started and reply sent, and a
+warning whenever `allowed_users` or `allowed_conversations` skips a message.
+DEBUG logging adds frame acknowledgements and empty sweeps.
 
 Message IDs deduplicate live/recovery overlap. Replies are frozen in SQLite
 before sending and retried with identical idempotency keys and content. A crash

@@ -239,3 +239,81 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
         acknowledgements = [args["state"] for name, args in self.transport.calls
                             if name == "acknowledge_agent_inbox_item"]
         self.assertEqual(acknowledgements, ["in_progress", "read"])
+
+    # Ando's current shape: one inbox item per message, recovered by its exact
+    # source message (apps/convex/src/agentInbox.ts readAgentInbox).
+    def message_item(self, **overrides):
+        return {
+            **ITEM,
+            "recovery": {
+                "tool": "get_message",
+                "arguments": {"message_id": "message-2"},
+                "coverage": "current_message_and_reactions",
+            },
+            **overrides,
+        }
+
+    async def test_message_item_starts_a_turn_and_is_handled(self):
+        item = self.message_item()
+        original = self.transport.call
+
+        async def per_message(name, args):
+            if name == "get_agent_inbox" and not self.transport.archived:
+                await original(name, args)
+                return {
+                    "items": [] if args["scope"] == "updates" else [copy.deepcopy(item)],
+                    "page": {"has_more": False},
+                }
+            return await original(name, args)
+
+        self.transport.call = per_message
+        with self.assertLogs("plugin.inbox", "INFO") as logs:
+            await self.inbox.sweep()
+        self.assertEqual(len(self.turns), 1)
+        self.assertEqual(self.turns[0]["content"], "Hello")
+        self.assertTrue(self.state.completed("message:message-2"))
+        self.assertFalse(self.state.completed("message:message-1"))
+        acknowledgements = [args["state"] for name, args in self.transport.calls
+                            if name == "acknowledge_agent_inbox_item"]
+        self.assertEqual(acknowledgements, ["in_progress", "handled"])
+        self.assertNotIn(
+            "get_messages_by_time_range", [name for name, _ in self.transport.calls]
+        )
+        self.assertTrue(any("handled" in line for line in logs.output))
+        # The same message arriving live never regenerates.
+        await self.inbox.on_event(event(message_id="message-2"))
+        self.assertEqual(len(self.turns), 1)
+
+    async def test_message_item_reply_includes_root_and_answers_in_thread(self):
+        original = self.transport.call
+
+        async def threaded(name, args):
+            result = await original(name, args)
+            if name == "get_message" and args["message_id"] == "message-2":
+                result["data"]["thread_root_id"] = "root"
+            return result
+
+        self.transport.call = threaded
+        await self.inbox.handle(self.message_item(type="reply"))
+        self.assertIn('"id": "root"', self.turns[0]["content"])
+        self.assertTrue(self.turns[0]["content"].endswith("Hello"))
+        sends = [(name, args) for name, args in self.transport.calls
+                 if name in {"send_message", "reply_to_message"}]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0][0], "reply_to_message")
+        self.assertEqual(sends[0][1]["message_id"], "root")
+        self.assertFalse(self.state.completed("message:root"))
+
+    async def test_unknown_recovery_tool_is_left_unread_with_a_warning(self):
+        item = self.message_item(recovery={"tool": "get_future_context", "arguments": {}})
+        with self.assertLogs("plugin.inbox", "WARNING") as logs:
+            await self.inbox.handle(item)
+            await self.inbox.handle(item)
+        self.assertEqual(self.turns, [])
+        self.assertEqual(
+            [name for name, _ in self.transport.calls
+             if name == "acknowledge_agent_inbox_item"],
+            [],
+        )
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("get_future_context", logs.output[0])

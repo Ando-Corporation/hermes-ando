@@ -1,7 +1,7 @@
 name: ando-platform
 label: Ando
 kind: platform
-version: 0.2.0
+version: 0.2.1
 description: Receive Ando messages in a persistent Hermes gateway and reply as your invited agent.
 author: Ando
 python_dependencies:

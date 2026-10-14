@@ -1,6 +1,10 @@
 """Ando event -> one Hermes turn -> durable, idempotent Ando reply."""
 
+import logging
+
 from .protocol import SetupRequired, message_reference
+
+logger = logging.getLogger(__name__)
 
 
 def disabled_tool_names(preferences):
@@ -88,7 +92,11 @@ class MessageDelivery:
         if ref is not None and self.credential_mode == "invitation":
             # Live and recovered deliveries must share a stable identity.
             ref["event_id"] = f"message:{ref['message_id']}"
-        if ref is None or self.state.completed(ref["event_id"]):
+        if ref is None:
+            logger.debug("Ando event is not another member's new message; no turn")
+            return
+        if self.state.completed(ref["event_id"]):
+            logger.debug("Ando message %s was already answered", ref["message_id"])
             return
         if (
             self.allowed_users is not None
@@ -96,12 +104,23 @@ class MessageDelivery:
             and ref["author_id"] not in self.allowed_users
         ):
             # The adapter's explicit local allowlist can be narrower than Ando's access.
+            logger.warning(
+                "Ando message %s is from member %s, who is not in allowed_users; no turn. "
+                "Set ANDO_ALLOWED_USERS or ANDO_ALLOW_ALL_USERS to admit them",
+                ref["message_id"],
+                ref["author_id"],
+            )
             self.state.complete(ref["event_id"])
             return
         if (
             self.allowed_conversations
             and ref["conversation_id"] not in self.allowed_conversations
         ):
+            logger.warning(
+                "Ando message %s is in conversation %s, which is not in allowed_conversations; no turn",
+                ref["message_id"],
+                ref["conversation_id"],
+            )
             self.state.complete(ref["event_id"])
             return
         await self.preferences()
@@ -174,12 +193,18 @@ class MessageDelivery:
         self.active = ref
         self.ordinal = 0
         self.state.begin(ref["event_id"])
+        logger.info(
+            "Ando starting a Hermes turn for message %s in %s",
+            ref["message_id"],
+            ref["conversation_id"],
+        )
         try:
             await self.dispatch(ref, message, self.disabled_names)
             replies = self.state.replies(ref["event_id"])
             if not replies or any(not reply[3] for reply in replies):
                 raise RuntimeError("Hermes finished without a confirmed Ando reply")
             self.state.complete(ref["event_id"])
+            logger.info("Ando replied to message %s", ref["message_id"])
         finally:
             self.active = None
 
