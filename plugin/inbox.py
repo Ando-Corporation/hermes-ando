@@ -6,8 +6,16 @@ need attention, and its optional execution claim prevents competing receivers.
 
 import asyncio
 import json
+import logging
 
 from .protocol import SetupRequired, message_reference
+
+logger = logging.getLogger(__name__)
+
+# Ando returns one of these per message item. `get_message` names the exact
+# source message (one inbox item per message); `get_messages_by_time_range`
+# names the history window of an older grouped item.
+SUPPORTED_RECOVERY_TOOLS = {"get_message", "get_messages_by_time_range"}
 
 
 class InboxRecovery:
@@ -16,6 +24,7 @@ class InboxRecovery:
         self.delivery = delivery
         self.lock = asyncio.Lock()
         self.owner = transport.connection["receiver_id"]
+        self.warned = set()
 
     async def on_event(self, frame):
         message_reference(
@@ -25,6 +34,7 @@ class InboxRecovery:
 
     async def sweep(self):
         async with self.lock:
+            found = 0
             for scope in ("direct", "updates"):
                 args = {"scope": scope, "limit": 100}
                 seen = set()
@@ -36,6 +46,7 @@ class InboxRecovery:
                             "direct_message",
                             "reply",
                         } and item.get("message_id"):
+                            found += 1
                             await self.handle(item)
                     page = result["page"]
                     if not page["has_more"]:
@@ -45,6 +56,10 @@ class InboxRecovery:
                         raise SetupRequired("Ando inbox pagination did not advance")
                     seen.add(cursor)
                     args = {**args, "cursor": cursor}
+            if found:
+                logger.info("Ando inbox sweep processed %d message item(s)", found)
+            else:
+                logger.debug("Ando inbox sweep found no message items")
 
     async def acknowledge(self, item, state, revision):
         result = await self.transport.call(
@@ -141,11 +156,50 @@ class InboxRecovery:
                 if bound in period:
                     args[bound] = period[bound]
 
+    async def thread_root(self, item):
+        """Context for a single-message item: its thread root, when it is a reply."""
+        root_id = item.get("thread_root_message_id")
+        if not root_id or root_id == item["message_id"]:
+            return []
+        root = await self.transport.call("get_message", {"message_id": root_id})
+        root = root.get("data", root)
+        if (
+            root.get("id") != root_id
+            or root.get("conversation_id") != item["conversation_id"]
+            or root.get("content_truncated")
+        ):
+            raise SetupRequired("Ando could not recover the original thread root")
+        return [root]
+
     async def handle(self, item):
         if not item.get("revision"):
             raise SetupRequired(
                 "Ando must return revisioned inbox items before automatic receiving can start"
             )
+        recovery = item.get("recovery")
+        tool = recovery.get("tool") if recovery else None
+        if recovery and tool not in SUPPORTED_RECOVERY_TOOLS:
+            # Leave the item unclaimed and unread so a plugin that understands
+            # this recovery shape can still answer it. Never drop it silently.
+            if item["event_id"] not in self.warned:
+                self.warned.add(item["event_id"])
+                logger.warning(
+                    "Ando inbox item %s (%s) has recovery tool %r; this plugin supports %s. "
+                    "Leaving it unread; upgrade the Ando Hermes plugin to answer it",
+                    item["event_id"],
+                    item.get("type"),
+                    tool,
+                    sorted(SUPPORTED_RECOVERY_TOOLS),
+                )
+            return
+        logger.info(
+            "Ando inbox item %s (%s, message %s, recovery %s, state %s)",
+            item["event_id"],
+            item.get("type"),
+            item.get("message_id"),
+            tool,
+            item.get("handling_state"),
+        )
         state = self.delivery.state
         # Acquire before any generation; the claim survives disconnects and new
         # messages. The same installation may resume its prepared reply.
@@ -164,9 +218,13 @@ class InboxRecovery:
         if {"get_message", "list_conversations"} & disabled:
             raise SetupRequired("Ando message reading is disabled in Settings > Members")
         recovery = item.get("recovery")
-        if not recovery or recovery.get("tool") != "get_messages_by_time_range":
-            # Revoked/inaccessible activity can have no recoverable context.
+        if not recovery:
+            # Revoked/inaccessible activity has no recoverable context.
             # Retire that row without trying to read its unavailable source.
+            logger.info(
+                "Ando inbox item %s has no recoverable context (access removed); marking it read",
+                current_item["event_id"],
+            )
             await self.acknowledge(current_item, "read", revision)
             state.set(pending_key, "")
             return
@@ -188,19 +246,26 @@ class InboxRecovery:
                 "thread_root_id", item.get("thread_root_message_id")
             ),
         }
-        messages = await self.history(item)
-        if messages is None:
-            await self.acknowledge(current_item, "read", revision)
-            state.set(pending_key, "")
-            return
-        covered_key = f"covered:{key}"
-        frozen = state.get(covered_key)
-        if frozen is None:
-            covered = [
+        if recovery["tool"] == "get_message":
+            # One item per message: the source message is the request. Earlier
+            # unhandled messages are their own items and get their own turns.
+            messages = await self.thread_root(item)
+            covered_now = [item["message_id"]]
+        else:
+            messages = await self.history(item)
+            if messages is None:
+                await self.acknowledge(current_item, "read", revision)
+                state.set(pending_key, "")
+                return
+            covered_now = [
                 m["id"]
                 for m in messages
                 if m.get("authorWorkspaceMembershipId") != self.delivery.membership_id
             ]
+        covered_key = f"covered:{key}"
+        frozen = state.get(covered_key)
+        if frozen is None:
+            covered = covered_now
             state.set(covered_key, json.dumps(covered))
         else:
             covered = json.loads(frozen)
@@ -223,11 +288,12 @@ class InboxRecovery:
                 },
             }
         }
-        await self.delivery.handle(frame, history=messages)
+        await self.delivery.handle(frame, history=messages or None)
         for message_id in covered:
             state.complete(f"message:{message_id}")
         state.set(pending_key, "")
         if item["message_id"] == current_item["message_id"]:
             await self.acknowledge(current_item, "handled", revision)
+            logger.info("Ando inbox item %s handled", current_item["event_id"])
         # New source activity must be processed in its own turn. Retain the
         # durable claim; the next sweep sees it with a fresh revision.
