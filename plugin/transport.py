@@ -74,7 +74,7 @@ class AndoTransport:
                     async with ClientSession(
                         streams[0],
                         streams[1],
-                        client_info=Implementation(name="Ando Hermes", version="0.2.1"),
+                        client_info=Implementation(name="Ando Hermes", version="0.2.2"),
                     ) as session:
                         self.session = session
                         await session.initialize()

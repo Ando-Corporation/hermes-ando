@@ -4,8 +4,10 @@ import argparse
 import asyncio
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import sys
+import time
 import uuid
 
 from .connection import (
@@ -14,7 +16,13 @@ from .connection import (
     redeem_invitation,
     validate_connection,
 )
-from .protocol import SetupRequired, verify_identity, verify_workspace_info
+from .protocol import (
+    SetupRequired,
+    lock_acquired,
+    message_reference,
+    verify_identity,
+    verify_workspace_info,
+)
 from .transport import AndoTransport
 
 
@@ -67,6 +75,17 @@ def setup_parser(parser):
     sub.add_parser(
         "doctor",
         help="Verify runtime dependencies, credentials and current Ando access",
+    )
+    test = sub.add_parser(
+        "test",
+        help="Check what would stop this profile receiving Ando messages",
+    )
+    test.add_argument(
+        "--wait",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help="With the gateway stopped, wait for a message sent to this agent in Ando",
     )
     sub.add_parser(
         "disconnect", help="Disable receiving; retain identity and recovery state"
@@ -215,6 +234,152 @@ async def connect(args, home, config, save_config):
     )
 
 
+HELLO_TIMEOUT_SECONDS = 15
+
+
+async def receiving_test(args, config, connection, *, socket_connect=None):
+    """Read-only: claims nothing, acknowledges nothing, saves no cursor."""
+    from gateway.status import acquire_scoped_lock, release_scoped_lock
+    from utils import is_truthy_value
+
+    from .inbox import SUPPORTED_RECOVERY_TOOLS
+    from .transport import websocket_connect
+    from .protocol import PROTOCOL
+
+    failures = []
+
+    def report(ok, text):
+        print(f"{'✓' if ok else '✗'} {text}")
+        if not ok:
+            failures.append(text)
+
+    try:
+        preflight(config)
+        report(True, "Plugin enabled and its dependencies installed")
+    except SetupRequired as exc:
+        report(False, str(exc))
+    report(
+        config.get("gateway", {}).get("platforms", {}).get("ando", {}).get("enabled")
+        is True,
+        "Ando receiving enabled in this profile's config.yaml",
+    )
+    if os.environ.get("GATEWAY_RELAY_URL", "").strip() and not is_truthy_value(
+        os.environ.get("GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS")
+    ):
+        report(
+            False,
+            "GATEWAY_RELAY_URL is set, so the gateway turns Ando off. Add "
+            "GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS=true to this profile's .env",
+        )
+    transport = AndoTransport(
+        None, connection["agent_membership_id"], connection=connection
+    )
+    async with transport.connected():
+        verify_identity(
+            await transport.call("get_current_identity", {}),
+            connection["workspace_id"],
+            connection["agent_membership_id"],
+        )
+        report(True, "Ando accepts this agent's credential")
+        workspace = await transport.call("get_workspace_info", {})
+        receiving = workspace.get("delivery", {}).get("receiving") or {}
+        extra = configured_identity(config)
+        report(
+            not (
+                extra.get("credential_mode") == "invitation"
+                and receiving.get("configured_method") == "https"
+            ),
+            "Ando sends this agent's messages over WebSocket, not to another HTTPS receiver",
+        )
+        waiting = unsupported = 0
+        for scope in ("direct", "updates"):
+            args_ = {"scope": scope, "limit": 100}
+            seen = set()
+            while True:
+                result = await transport.call("get_agent_inbox", args_)
+                for item in result["items"]:
+                    if item.get("type") in {"mention", "direct_message", "reply"}:
+                        waiting += 1
+                        tool = (item.get("recovery") or {}).get("tool")
+                        unsupported += bool(tool and tool not in SUPPORTED_RECOVERY_TOOLS)
+                page = result.get("page") or {}
+                if not page.get("has_more"):
+                    break
+                cursor = page.get("next_cursor")
+                if not cursor or cursor in seen:
+                    raise SetupRequired("Ando inbox pagination did not advance")
+                seen.add(cursor)
+                args_ = {**args_, "cursor": cursor}
+        report(
+            not unsupported,
+            f"Inbox readable: {waiting} message item(s) waiting"
+            + (
+                f", {unsupported} this plugin can't answer; upgrade it"
+                if unsupported
+                else ""
+            ),
+        )
+        key = f"{connection['workspace_id']}:{connection['agent_membership_id']}"
+        if not lock_acquired(acquire_scoped_lock("ando", key)):
+            print(
+                "  The gateway is running this receiver; its log shows each Realtime "
+                "event. Stop the gateway to test Realtime here."
+            )
+            report(not args.wait, "--wait needs the gateway stopped")
+        else:
+            try:
+                ticket = await transport.ticket(None)
+                async with (socket_connect or websocket_connect)(
+                    ticket["url"],
+                    subprotocols=[PROTOCOL],
+                    max_size=512 * 1024,
+                    open_timeout=30,
+                    close_timeout=10,
+                ) as socket:
+                    await realtime_check(socket, connection, args.wait, report)
+            finally:
+                release_scoped_lock("ando", key)
+    if failures:
+        raise SystemExit(1)
+
+
+async def realtime_check(socket, connection, wait, report):
+    async def frame(timeout):
+        return json.loads(await asyncio.wait_for(socket.recv(), timeout))
+
+    try:
+        hello = await frame(HELLO_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        hello = {}
+    if hello.get("type") != "hello":
+        report(False, "Realtime connected but Ando never confirmed the subscription")
+        return
+    report(True, "Realtime connected and subscribed to new messages")
+    if not wait:
+        return
+    print(
+        f"  Send this agent a message in Ando now; waiting {wait}s. "
+        "It stays unread for the gateway to answer."
+    )
+    deadline = time.monotonic() + wait
+    while (left := deadline - time.monotonic()) > 0:
+        try:
+            event = await frame(left)
+        except asyncio.TimeoutError:
+            break
+        if event.get("type") == "disconnect":
+            report(False, f"Ando closed Realtime ({event.get('reason')})")
+            return
+        reference = event.get("type") == "event" and message_reference(
+            event, connection["workspace_id"], connection["agent_membership_id"]
+        )
+        if reference:
+            # No ACK: the gateway's inbox sweep still owns this message.
+            report(True, f"Message {reference['message_id']} arrived over Realtime")
+            return
+    report(False, f"No message arrived over Realtime in {wait}s")
+
+
 async def execute(args):
     from hermes_cli.config import load_config, save_config
 
@@ -226,7 +391,7 @@ async def execute(args):
             from gateway.status import acquire_scoped_lock, release_scoped_lock
 
             lock = f"{extra.get('workspace_id')}:{extra.get('membership_id')}"
-            if not acquire_scoped_lock("ando", lock):
+            if not lock_acquired(acquire_scoped_lock("ando", lock)):
                 raise SetupRequired(
                     "Stop the Ando receiver before changing its credentials"
                 )
@@ -248,7 +413,7 @@ async def execute(args):
             if not extra:
                 raise SetupRequired("No configured Ando identity")
             lock = f"{extra['workspace_id']}:{extra['membership_id']}"
-            if not acquire_scoped_lock("ando", lock):
+            if not lock_acquired(acquire_scoped_lock("ando", lock)):
                 raise SetupRequired(
                     "Stop the gateway before recovering an interrupted generation"
                 )
@@ -265,6 +430,18 @@ async def execute(args):
             finally:
                 release_scoped_lock("ando", lock)
             print("Interrupted generation can be retried. Restart the gateway.")
+        elif args.operation == "test":
+            if not extra:
+                raise SetupRequired("No configured Ando identity")
+            connection = read_connection(home / "ando" / "connection.json")
+            if (extra.get("workspace_id"), extra.get("membership_id")) != (
+                connection["workspace_id"],
+                connection["agent_membership_id"],
+            ):
+                raise SetupRequired(
+                    "config.yaml and the saved credential name different Ando agents; run `hermes ando connect` again"
+                )
+            await receiving_test(args, config, connection)
         else:
             connection = read_connection(home / "ando" / "connection.json")
             if args.operation == "doctor":
@@ -279,7 +456,7 @@ async def execute(args):
                         connection["agent_membership_id"],
                     )
                 print(
-                    "Dependencies and current agent identity verified; a real reply is still required to verify receiving."
+                    "Dependencies and current agent identity verified. Run `hermes ando test` to check receiving."
                 )
             print(
                 json.dumps(

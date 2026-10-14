@@ -96,3 +96,8 @@ def message_reference(frame, workspace_id, membership_id):
         "author_id": obj["authorWorkspaceMembershipId"],
         "thread_id": event.get("related", {}).get("thread_root_message_id"),
     }
+
+
+def lock_acquired(result):
+    """Hermes's acquire_scoped_lock returns (acquired, owner); older releases a bool."""
+    return bool(result[0]) if isinstance(result, tuple) else bool(result)
