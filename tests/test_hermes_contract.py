@@ -78,6 +78,17 @@ class HermesContractTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.get_running_loop().shutdown_default_executor()
         self.tmp.cleanup()
 
+    async def test_second_receiver_for_the_same_agent_is_refused(self):
+        self.adapter.config.extra.update(
+            credential_mode="invitation", installer_id="human"
+        )
+        with patch(
+            "gateway.status.acquire_scoped_lock",
+            return_value=(False, {"pid": 1}),
+        ):
+            self.assertFalse(await self.adapter.connect())
+        self.assertEqual(self.adapter.fatal_error_code, "lock_conflict")
+
     async def test_idle_delivery_starts_real_background_turn_and_waits_for_confirmed_reply(
         self,
     ):

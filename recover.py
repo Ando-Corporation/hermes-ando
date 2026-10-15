@@ -9,6 +9,7 @@ import argparse
 from pathlib import Path
 from uuid import UUID
 
+from plugin.protocol import lock_acquired
 from plugin.state import DeliveryState
 
 
@@ -31,7 +32,7 @@ def main():
     from gateway.status import acquire_scoped_lock, release_scoped_lock
 
     key = f"{args.workspace_id}:{args.membership_id}"
-    if not acquire_scoped_lock("ando", key):
+    if not lock_acquired(acquire_scoped_lock("ando", key)):
         parser.error("Stop the Ando gateway before recovering a turn")
     try:
         path = Path(get_hermes_home()) / "ando" / f"{args.membership_id}.sqlite3"

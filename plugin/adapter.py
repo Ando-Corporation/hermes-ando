@@ -12,7 +12,12 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.session import SessionSource
 
 from .delivery import MessageDelivery
-from .protocol import SetupRequired, verify_identity, verify_workspace_info
+from .protocol import (
+    SetupRequired,
+    lock_acquired,
+    verify_identity,
+    verify_workspace_info,
+)
 from .state import DeliveryState
 from .transport import AndoTransport, listen
 
@@ -88,7 +93,7 @@ class AndoAdapter(BasePlatformAdapter):
         from hermes_constants import get_hermes_home
 
         self._lock_key = f"{self.extra['workspace_id']}:{self.extra['membership_id']}"
-        if not acquire_scoped_lock("ando", self._lock_key):
+        if not lock_acquired(acquire_scoped_lock("ando", self._lock_key)):
             self._lock_key = None
             self._set_fatal_error(
                 "lock_conflict",

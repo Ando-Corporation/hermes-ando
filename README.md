@@ -110,7 +110,15 @@ mode 600. SQLite and recovery metadata are also outside the plugin's upgrade
 directory. Treat the whole profile as private and retain it across upgrades.
 Never copy a live profile to two running hosts. `hermes ando status` prints only
 identity and configuration; `hermes ando doctor` checks dependencies and identity.
-Neither command claims receiving was verified. `hermes ando disconnect` disables
+
+`hermes ando test` checks what would stop this profile receiving: the plugin and
+its dependencies, `GATEWAY_RELAY_URL` without
+`GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS=true`, the credential, the inbox (and any
+items this plugin cannot answer) and, with the gateway stopped, that Realtime
+subscribes. `hermes ando test --wait 120` then waits for a message you send the
+agent in Ando and reports when it arrives. The test claims and acknowledges
+nothing, so the gateway still answers that message when it starts. It exits
+non-zero when a check fails. `hermes ando disconnect` disables
 the configuration; restart the gateway to apply, retaining identity and state.
 
 This release is text-focused and sequential. The receiver does not install all
