@@ -97,13 +97,27 @@ warning whenever `allowed_users` or `allowed_conversations` skips a message.
 DEBUG logging adds frame acknowledgements and empty sweeps.
 
 Message IDs deduplicate live/recovery overlap. Replies are frozen in SQLite
-before sending and retried with identical idempotency keys and content. A crash
-before a reply is prepared requires reviewing previous tool effects, stopping
-the gateway, and running `hermes ando recover EVENT_ID
---previous-effects-reviewed` in the original profile. Restart afterward. A lost
+before sending and retried with identical idempotency keys and content. A turn
+that stops before its reply is prepared (a crash, a restart or a failed
+generation) is never regenerated, because its tools may already have run.
+Instead the agent replies once that it stopped and asks the member to send the
+message again; receiving continues. To retry the turn itself, stop the gateway,
+review previous tool effects and run `hermes ando recover EVENT_ID
+--previous-effects-reviewed` in the original profile before restarting. A lost
 profile requires restoring its protected backup; do not invent a new receiver
 identity to bypass an unfinished claim. Network delivery is at least once; this
 is not a promise of exactly-once execution of arbitrary model tools.
+
+Ando gets the final reply only: the plugin registers Hermes's `low` display
+tier, which turns off tool progress, interim commentary and the "⏳ Working"
+heartbeat. Ando's 👀 on the message shows the turn started. To keep a heartbeat
+for long turns, set `display.platforms.ando.long_running_notifications: true`
+in the profile's config.yaml; it is posted once and then edited in place, and,
+like any status Hermes marks as interim, it is never stored or resent as the
+reply. Keep `tool_progress` off: Hermes sends tool progress unmarked, so this
+plugin would treat it as the reply. Hermes's gateway notices (no home channel,
+credits, failed subagents) stay in the gateway log rather than Ando: the plugin
+defaults `notice_delivery` to `private`, and Ando has no member-only notice.
 
 Credentials live in the profile's `ando/connection.json`, written atomically with
 mode 600. SQLite and recovery metadata are also outside the plugin's upgrade
@@ -121,19 +135,54 @@ nothing, so the gateway still answers that message when it starts. It exits
 non-zero when a check fails. `hermes ando disconnect` disables
 the configuration; restart the gateway to apply, retaining identity and state.
 
-This release is text-focused and sequential. The receiver does not install all
+This release is sequential. The receiver does not install all
 Ando tools in the model. Hermes keeps its own model/tool configuration; the
 adapter enforces Ando restrictions it can implement and stops when host-tool
-preferences cannot be enforced. Attachments, streaming edits, proactive sends,
+preferences cannot be enforced. Streaming edits, proactive sends,
 and automatic OS service installation are outside this release.
+
+## Files
+
+Files go both ways in the conversation being answered.
+
+Files Hermes sends (`MEDIA:` paths, images in the reply, `send_document`,
+`send_video`, `send_voice`, `send_image`) become Ando attachments on their own
+reply after the text. A batch of images is one message (up to 10 per message).
+Remote images are downloaded on the host first, through Hermes's SSRF-checked
+downloader. Ando accepts PNG, JPEG, GIF, WEBP, PDF, MP4, MOV, WebM, MP3, WAV,
+Ogg Vorbis, ZIP, DOCX, XLSX, PPTX, plain text, Markdown, CSV and JSON up to
+20 MB each. The type is decided from the file's bytes, not its extension.
+Anything else, including Opus `.ogg` and `.m4a` voice notes, is not uploaded,
+and Hermes posts its usual "Couldn't deliver" notice instead. An agent can
+request at most 20 uploads in 10 minutes.
+
+Attachments are part of the durable reply. Which local files a reply carries
+is recorded before upload, and uploads use idempotency keys derived from that
+reply. After a crash the gateway finishes the same reply without uploading
+finished bytes again or posting twice. A file that changed or disappeared
+before the restart becomes the "Couldn't deliver" text.
+
+Files a member attaches are downloaded when the message arrives, because their
+download links last about a minute. They are cached in the profile's Hermes
+cache, so images reach Hermes vision and other files appear as paths the model
+can open. At most 10 files of up to 20 MB each are read per message; anything
+not read is named in the message text. Turning off `upload_attachment` or
+`get_file` in **Settings > Members** stops files in that direction only; the
+turn still runs. Upload and download links get no Ando credential, are never
+followed through redirects, and are never logged.
 
 ## Compatibility and tests
 
 Validated against the actual Hermes source used in the release evidence. The
-current candidate test target is commit
-`38d3dbce4adbb9074a34214eb330237a129e5904`, Python 3.14, MCP 2.0.0,
-httpx2 2.7.0, and websockets 15.0.1. This is source compatibility evidence,
-not a claim that all Hermes versions or operating systems are supported.
+current candidate test targets are Hermes main
+`e6cf2a9b1e8f98d40408b09a9a55993c8459b4b4` and releases v0.22.2 and v0.21.7,
+Python 3.14, MCP 2.0.0, httpx2 2.12.0, and websockets 15.0.1. plugin.yaml
+declares bounded ranges rather than pins, so a Hermes that moved to a newer
+httpx2 can still install it. Hermes before v0.21.6 has no display tiers: the
+plugin still loads there but cannot keep tool progress out of Ando, and logs a
+warning to update Hermes.
+This is source compatibility evidence, not a claim that all Hermes versions or
+operating systems are supported.
 The current private-file lock implementation targets macOS/Linux.
 
 ```sh

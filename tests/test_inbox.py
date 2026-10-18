@@ -161,8 +161,13 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await self.inbox.handle(copy.deepcopy(ITEM))
         newer = {**ITEM, "message_id": "message-3", "revision": "newer"}
-        with self.assertRaisesRegex(SetupRequired, "message:message-2.*interrupted"):
-            await self.inbox.handle(newer)
+        await self.inbox.handle(newer)
+        # The interrupted message gets its one notice, never a second generation;
+        # the newer message keeps the claim for its own turn.
+        sends = [args for name, args in self.transport.calls if name == "send_message"]
+        self.assertEqual(len(sends), 1)
+        self.assertIn("Send it again", sends[0]["markdown_content"])
+        self.assertTrue(self.state.completed("message:message-2"))
         self.assertFalse(self.transport.archived)
         self.assertFalse(self.state.started("message:message-3"))
 

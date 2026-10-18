@@ -9,7 +9,7 @@ import argparse
 from pathlib import Path
 from uuid import UUID
 
-from plugin.protocol import lock_acquired
+from plugin.protocol import lock_acquired, release_scoped_lock
 from plugin.state import DeliveryState
 
 
@@ -29,7 +29,7 @@ def main():
         help="Confirm prior tool effects were inspected; retry may repeat them",
     )
     args = parser.parse_args()
-    from gateway.status import acquire_scoped_lock, release_scoped_lock
+    from gateway.status import acquire_scoped_lock
 
     key = f"{args.workspace_id}:{args.membership_id}"
     if not lock_acquired(acquire_scoped_lock("ando", key)):

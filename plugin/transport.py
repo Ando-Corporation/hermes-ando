@@ -14,11 +14,19 @@ from .protocol import PROTOCOL, SetupRequired, resource_origin, verify_ticket
 
 logger = logging.getLogger(__name__)
 
+# What every connection names itself on MCP initialize; Ando compares it with
+# the published release to tell the installer when to update (plugin.yaml).
+CLIENT_INFO = {"name": "Ando Hermes", "version": "0.2.4"}
+
 
 def websocket_connect(*args, **kwargs):
     # Keep the optional socket dependency at the actual network boundary.
     from websockets.asyncio.client import connect
     return connect(*args, **kwargs)
+
+
+class ToolError(RuntimeError):
+    """Ando answered the tool call with an error: a definite refusal, not a lost connection."""
 
 
 class ReplayExpired(SetupRequired):
@@ -74,7 +82,7 @@ class AndoTransport:
                     async with ClientSession(
                         streams[0],
                         streams[1],
-                        client_info=Implementation(name="Ando Hermes", version="0.2.2"),
+                        client_info=Implementation(**CLIENT_INFO),
                     ) as session:
                         self.session = session
                         await session.initialize()
@@ -119,7 +127,7 @@ class AndoTransport:
                     async with ClientSession(
                         read,
                         write,
-                        client_info=Implementation(name="Ando Hermes", version="0.1.0"),
+                        client_info=Implementation(**CLIENT_INFO),
                     ) as session:
                         self.session = session
                         await session.initialize()
@@ -135,7 +143,7 @@ class AndoTransport:
         result = await self.session.call_tool(name, arguments)
         if getattr(result, "is_error", getattr(result, "isError", False)):
             # Tool error text can contain private context or URLs. Keep logs generic.
-            raise RuntimeError(f"Ando {name} failed; review the connection in Ando")
+            raise ToolError(f"Ando {name} failed; review the connection in Ando")
         structured = getattr(
             result, "structured_content", getattr(result, "structuredContent", None)
         )

@@ -29,6 +29,11 @@ class DeliveryState:
                 tool TEXT NOT NULL, arguments TEXT NOT NULL, message_id TEXT,
                 PRIMARY KEY(event_id, ordinal)
             );
+            CREATE TABLE IF NOT EXISTS uploads (
+                event_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                intent TEXT NOT NULL, reply TEXT,
+                PRIMARY KEY(event_id, ordinal)
+            );
         """)
         identity = json.dumps([workspace_id, membership_id])
         existing = self.get("identity")
@@ -94,11 +99,65 @@ class DeliveryState:
             for ordinal, tool, arguments, message_id in rows
         ]
 
+    def _key(self, *parts):
+        joined = ":".join(str(part) for part in (self.get("identity"), *parts))
+        return f"hermes-ando:{hashlib.sha256(joined.encode()).hexdigest()}"
+
+    def upload_key(self, event_id, ordinal, index, file, attempt=0):
+        # Everything Ando matches an upload replay on (bytes, so size and type,
+        # and name) is in the key: another batch reusing a failed batch's
+        # ordinal must never be handed, or refused for, that batch's file.
+        return self._key(
+            event_id, ordinal, "file", index, file.sha256, file.filename, attempt
+        )
+
+    def prepare_upload(self, event_id, ordinal, intent):
+        """Freeze which local files an attachment reply will carry, before any upload."""
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO uploads VALUES (?, ?, ?, NULL)",
+                (event_id, ordinal, intent),
+            )
+        row = self.db.execute(
+            "SELECT intent FROM uploads WHERE event_id = ? AND ordinal = ?",
+            (event_id, ordinal),
+        ).fetchone()
+        if row[0] != intent:
+            raise ValueError("A retry attempted to change already prepared Ando attachments")
+
+    def uploaded(self, event_id, ordinal, reply):
+        """Record the finished reply arguments (file_ids, caption, notices) together."""
+        with self.db:
+            self.db.execute(
+                "UPDATE uploads SET reply = ? WHERE event_id = ? AND ordinal = ?",
+                (json.dumps(reply, sort_keys=True), event_id, ordinal),
+            )
+
+    def discard_upload(self, event_id, ordinal):
+        """A live upload failed before its reply was prepared; Hermes reports it instead."""
+        with self.db:
+            self.db.execute(
+                "DELETE FROM uploads WHERE event_id = ? AND ordinal = ? AND NOT EXISTS "
+                "(SELECT 1 FROM replies WHERE replies.event_id = uploads.event_id "
+                "AND replies.ordinal = uploads.ordinal)",
+                (event_id, ordinal),
+            )
+
+    def pending_uploads(self, event_id):
+        """Attachment intents a crash left without a prepared reply, in order."""
+        rows = self.db.execute(
+            "SELECT ordinal, intent, reply FROM uploads WHERE event_id = ? AND NOT EXISTS "
+            "(SELECT 1 FROM replies WHERE replies.event_id = uploads.event_id "
+            "AND replies.ordinal = uploads.ordinal) ORDER BY ordinal",
+            (event_id,),
+        ).fetchall()
+        return [
+            (ordinal, intent, None if reply is None else json.loads(reply))
+            for ordinal, intent, reply in rows
+        ]
+
     def prepare_reply(self, event_id, ordinal, tool, arguments):
-        key = hashlib.sha256(
-            f"{self.get('identity')}:{event_id}:{ordinal}".encode()
-        ).hexdigest()
-        arguments = {**arguments, "idempotency_key": f"hermes-ando:{key}"}
+        arguments = {**arguments, "idempotency_key": self._key(event_id, ordinal)}
         serialized = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
         with self.db:
             self.db.execute(

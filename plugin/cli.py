@@ -20,6 +20,7 @@ from .protocol import (
     SetupRequired,
     lock_acquired,
     message_reference,
+    release_scoped_lock,
     verify_identity,
     verify_workspace_info,
 )
@@ -239,7 +240,7 @@ HELLO_TIMEOUT_SECONDS = 15
 
 async def receiving_test(args, config, connection, *, socket_connect=None):
     """Read-only: claims nothing, acknowledges nothing, saves no cursor."""
-    from gateway.status import acquire_scoped_lock, release_scoped_lock
+    from gateway.status import acquire_scoped_lock
     from utils import is_truthy_value
 
     from .inbox import SUPPORTED_RECOVERY_TOOLS
@@ -388,7 +389,7 @@ async def execute(args):
         config = load_config()
         extra = configured_identity(config)
         if args.operation == "connect":
-            from gateway.status import acquire_scoped_lock, release_scoped_lock
+            from gateway.status import acquire_scoped_lock
 
             lock = f"{extra.get('workspace_id')}:{extra.get('membership_id')}"
             if not lock_acquired(acquire_scoped_lock("ando", lock)):
@@ -407,7 +408,7 @@ async def execute(args):
                 "Ando receiving disabled in configuration. Restart the gateway to apply. Identity and recovery state retained."
             )
         elif args.operation == "recover":
-            from gateway.status import acquire_scoped_lock, release_scoped_lock
+            from gateway.status import acquire_scoped_lock
             from .state import DeliveryState
 
             if not extra:

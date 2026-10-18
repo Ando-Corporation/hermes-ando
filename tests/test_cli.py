@@ -289,7 +289,7 @@ class ReceivingTestCommand(unittest.IsolatedAsyncioTestCase):
             patch("plugin.cli.AndoTransport", TestTransport),
             patch("plugin.cli.preflight", lambda config: None),
             patch("gateway.status.acquire_scoped_lock", return_value=lock),
-            patch("gateway.status.release_scoped_lock") as release,
+            patch("plugin.cli.release_scoped_lock") as release,
             patch.dict(os.environ, env or {}, clear=False),
             redirect_stdout(output),
         ):
@@ -399,7 +399,7 @@ class RecoverScript(unittest.TestCase):
         with (
             patch.object(sys, "argv", argv),
             patch("gateway.status.acquire_scoped_lock", return_value=(False, {"pid": 1})),
-            patch("gateway.status.release_scoped_lock") as release,
+            patch("recover.release_scoped_lock") as release,
             patch("recover.DeliveryState") as state,
             redirect_stdout(io.StringIO()),
             patch("sys.stderr", io.StringIO()) as stderr,

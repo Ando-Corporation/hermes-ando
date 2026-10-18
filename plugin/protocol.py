@@ -101,3 +101,12 @@ def message_reference(frame, workspace_id, membership_id):
 def lock_acquired(result):
     """Hermes's acquire_scoped_lock returns (acquired, owner); older releases a bool."""
     return bool(result[0]) if isinstance(result, tuple) else bool(result)
+
+
+def release_scoped_lock(scope, identity):
+    """Hermes moved this out of gateway.status (hermes-agent 861a0299, 2026-10-17)."""
+    try:
+        from gateway.status_scoped_locks import release_scoped_lock as release
+    except ImportError:
+        from gateway.status import release_scoped_lock as release
+    release(scope, identity)

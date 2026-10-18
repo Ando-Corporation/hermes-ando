@@ -16,6 +16,13 @@ from unittest.mock import patch
 from test_delivery import FakeTransport, event
 
 
+def hermes_has_display_tiers():
+    import inspect
+    from gateway.platform_registry import PlatformEntry
+
+    return "display_tier" in inspect.signature(PlatformEntry).parameters
+
+
 @unittest.skipUnless(
     os.environ.get("HERMES_SOURCE"),
     "Set HERMES_SOURCE to run real Hermes lifecycle compatibility tests",
@@ -89,6 +96,48 @@ class HermesContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await self.adapter.connect())
         self.assertEqual(self.adapter.fatal_error_code, "lock_conflict")
 
+    def test_registration_without_display_tiers_still_loads(self):
+        # Hermes before v0.21.6 rejects display_tier; the plugin must still
+        # register there (noisier) instead of failing to load.
+        import dataclasses
+        from gateway import platform_registry
+        from plugin.adapter import register
+
+        older = dataclasses.make_dataclass(
+            "PlatformEntry",
+            [
+                (f.name, f.type, f)
+                for f in dataclasses.fields(platform_registry.PlatformEntry)
+                if f.name != "display_tier"
+            ],
+        )
+        registered = []
+        with (
+            patch.object(platform_registry, "PlatformEntry", older),
+            self.assertLogs("plugin.adapter", "WARNING") as logs,
+        ):
+            register(SimpleNamespace(register_platform=lambda **kw: registered.append(older(**kw))))
+        self.assertEqual(registered[0].name, "ando")
+        self.assertIn("update Hermes", logs.output[0])
+        if hermes_has_display_tiers():
+            register(SimpleNamespace(register_platform=lambda **kw: registered.append(kw)))
+            self.assertEqual(registered[1]["display_tier"], "low")
+
+    async def test_disconnect_releases_the_receiver_lock(self):
+        # Hermes moved release_scoped_lock out of gateway.status; a failed
+        # import here left the gateway unable to finish disconnecting.
+        from gateway.status import acquire_scoped_lock
+        from plugin.protocol import lock_acquired
+
+        locks = Path(self.tmp.name) / "locks"
+        with patch.dict(os.environ, {"HERMES_GATEWAY_LOCK_DIR": str(locks)}):
+            self.adapter._lock_key = "workspace:agent"
+            self.assertTrue(lock_acquired(acquire_scoped_lock("ando", "workspace:agent")))
+            self.assertEqual(len(list(locks.glob("*.lock"))), 1)
+            await self.adapter.disconnect()
+            self.assertEqual(list(locks.glob("*.lock")), [])
+        self.assertIsNone(self.adapter._lock_key)
+
     async def test_idle_delivery_starts_real_background_turn_and_waits_for_confirmed_reply(
         self,
     ):
@@ -126,6 +175,85 @@ class HermesContractTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
         self.assertEqual(keys[0], keys[1])
         self.assertNotEqual(keys[1], keys[2])
+
+    async def test_registered_tier_keeps_ando_quiet_unless_the_operator_opts_in(self):
+        if not hermes_has_display_tiers():
+            self.skipTest("This Hermes predates display tiers (v0.21.6)")
+        from gateway.display_config import resolve_display_setting
+
+        quiet = {
+            "tool_progress": "off",
+            "interim_assistant_messages": False,
+            "long_running_notifications": False,
+            "busy_ack_detail": False,
+            "streaming": False,
+        }
+        for setting, value in quiet.items():
+            self.assertEqual(resolve_display_setting({}, "ando", setting), value)
+        opted_in = {"display": {"platforms": {"ando": {"long_running_notifications": True}}}}
+        self.assertTrue(
+            resolve_display_setting(opted_in, "ando", "long_running_notifications")
+        )
+
+    async def test_interim_sends_and_statuses_never_become_the_reply(self):
+        from gateway.run import _interim_metadata
+
+        edits = {}
+
+        async def handler(incoming):
+            chat = incoming.source.chat_id
+            beat = await self.adapter.send(
+                chat, "⏳ Working — 3 min", metadata=_interim_metadata()
+            )
+            edited = await self.adapter.edit_message(chat, beat.message_id, "⏳ Working — 6 min")
+            edits["heartbeat"] = edited.success
+            first = await self.adapter.send_or_update_status(chat, "context", "Compressing")
+            again = await self.adapter.send_or_update_status(chat, "context", "Compressed")
+            edits["status"] = again.message_id == first.message_id
+            edits["foreign"] = (
+                await self.adapter.edit_message(chat, "someone-else", "x")
+            ).success
+            return "A real Hermes lifecycle reply"
+
+        self.adapter.set_message_handler(handler)
+        await asyncio.wait_for(self.adapter._delivery.handle(event()), 5)
+        self.assertEqual(edits, {"heartbeat": True, "status": True, "foreign": False})
+        self.assertEqual(
+            [(tool, args["markdown_content"]) for _, tool, args, _ in self.state.replies("event-1")],
+            [("send_message", "A real Hermes lifecycle reply")],
+        )
+        self.assertEqual(self.transport.posted, 2)
+        self.assertTrue(self.state.completed("event-1"))
+        # Statuses are not editable after their turn.
+        late = await self.adapter.edit_message(
+            "workspace/agent/conversation", "status-1", "late"
+        )
+        self.assertFalse(late.success)
+
+    async def test_gateway_setup_notices_stay_out_of_ando_and_the_reply(self):
+        from gateway.run_notifications import GatewayNotificationsMixin
+
+        runner = SimpleNamespace(
+            config=None,
+            _delivery_adapter_for=lambda source: self.adapter,
+            _thread_metadata_for_source=lambda source: None,
+        )
+
+        async def handler(incoming):
+            # The one-time "No home channel is set... type /sethome" prompt.
+            await GatewayNotificationsMixin._deliver_platform_notice(
+                runner, incoming.source, "📬 No home channel is set for Ando."
+            )
+            return "A real Hermes lifecycle reply"
+
+        self.adapter.set_message_handler(handler)
+        with self.assertLogs("plugin.adapter", "WARNING"):
+            await asyncio.wait_for(self.adapter._delivery.handle(event()), 5)
+        self.assertEqual(
+            [args["markdown_content"] for _, _, args, _ in self.state.replies("event-1")],
+            ["A real Hermes lifecycle reply"],
+        )
+        self.assertEqual(self.transport.posted, 0)
 
     async def test_gateway_failure_does_not_complete_delivery(self):
         async def handler(_):

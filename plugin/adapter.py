@@ -12,9 +12,12 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.session import SessionSource
 
 from .delivery import MessageDelivery
+from .files import AttachmentFailed, MAX_FILES, missing_note
+from .media import failure_text, message_type
 from .protocol import (
     SetupRequired,
     lock_acquired,
+    release_scoped_lock,
     verify_identity,
     verify_workspace_info,
 )
@@ -67,9 +70,19 @@ def check_requirements():
 
 
 class AndoAdapter(BasePlatformAdapter):
+    # Only status messages can be edited. Streaming would deliver the reply as
+    # an edit, past the outbox that makes it exactly-once, so Hermes must not.
+    SUPPORTS_MESSAGE_EDITING = False
+
     def __init__(self, config):
         super().__init__(config, Platform("ando"))
-        self.extra = config.extra or {}
+        if config.extra is None:
+            config.extra = {}
+        # Hermes's setup and usage notices (no home channel, credits, failed
+        # subagents) are about this gateway, not the Ando conversation; see
+        # send_private_notice. An operator can still set notice_delivery: public.
+        config.extra.setdefault("notice_delivery", "private")
+        self.extra = config.extra
         self._receiver = None
         self._completion = None
         self._ready = None
@@ -245,14 +258,19 @@ class AndoAdapter(BasePlatformAdapter):
                 or "*" in local_allowed_users(self.extra)
             ),
         )
+        media_urls, media_types, missing = await self._cache_attachments(message)
+        text = message.get("content") or ""
+        if missing:
+            text = "\n".join(part for part in (text, missing_note(missing)) if part)
         event = MessageEvent(
-            text=message.get("content")
-            or "[Ando message contains attachments; use get_message/get_file to inspect them.]",
-            message_type=MessageType.TEXT,
+            text=text or ("" if media_urls else "[Ando message without text]"),
+            message_type=message_type(media_types),
             source=source,
             user_id=source.user_id,
             user_name=source.user_name,
             message_id=ref["message_id"],
+            media_urls=media_urls,
+            media_types=media_types,
             raw_message={"ando_event_id": ref["event_id"]},
             # Never let workspace text trigger local /restart, /approve, etc.
             allow_gateway_control=False,
@@ -268,6 +286,25 @@ class AndoAdapter(BasePlatformAdapter):
             await self._completion
         finally:
             self._completion = None
+
+    async def _cache_attachments(self, message):
+        """Download now (their URLs live 60 seconds) and cache where Hermes vision reads."""
+        if not message.get("attachments"):
+            return [], [], []
+        fetched, missing = await self._delivery.fetch_attachments(message)
+        paths, types = [], []
+        for data, filename, content_type in fetched:
+            try:
+                cached = await _cache_media(data, filename, content_type)
+            except Exception as exc:  # noqa: BLE001 - Hermes refused it; say so in the turn
+                logger.warning("Hermes did not cache an Ando attachment (%s)", type(exc).__name__)
+                cached = None
+            if cached is None:
+                missing.append((filename, "Hermes could not store it"))
+                continue
+            paths.append(cached[0])
+            types.append(cached[1])
+        return paths, types, missing
 
     async def on_processing_complete(self, event, outcome):
         future = self._completion
@@ -290,7 +327,11 @@ class AndoAdapter(BasePlatformAdapter):
         try:
             if self._delivery is None:
                 raise RuntimeError("Ando receiver is not connected")
-            message_id = await self._delivery.send(chat_id, content)
+            if (metadata or {}).get("_interim_send"):
+                # Hermes marks heartbeats and other mid-turn notes as interim.
+                message_id = await self._delivery.send_status(chat_id, content)
+            else:
+                message_id = await self._delivery.send(chat_id, content)
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             return SendResult(
@@ -298,6 +339,133 @@ class AndoAdapter(BasePlatformAdapter):
                 error=f"Ando send failed ({type(exc).__name__})",
                 retryable=False,
             )
+
+    async def send_or_update_status(self, chat_id, status_key, content, *, metadata=None):
+        try:
+            if self._delivery is None:
+                raise RuntimeError("Ando receiver is not connected")
+            message_id = await self._delivery.send_status(
+                chat_id, content, key=status_key
+            )
+            return SendResult(success=True, message_id=message_id)
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"Ando status failed ({type(exc).__name__})",
+                retryable=False,
+            )
+
+    async def send_private_notice(
+        self, chat_id, user_id, content, reply_to=None, metadata=None
+    ):
+        # Ando has no notice only one member sees, and these would tell members
+        # to type commands (/sethome) that allow_gateway_control=False refuses.
+        # Posted, Hermes's unmarked send would also become the turn's reply.
+        logger.warning("Hermes notice kept in this log, not posted to Ando: %s", content)
+        return SendResult(success=True)
+
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False):
+        try:
+            if self._delivery is None:
+                raise RuntimeError("Ando receiver is not connected")
+            await self._delivery.edit_status(chat_id, message_id, content)
+            return SendResult(success=True, message_id=message_id)
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"Ando edit failed ({type(exc).__name__})",
+                retryable=False,
+            )
+
+    async def delete_message(self, chat_id, message_id):
+        try:
+            if self._delivery is None:
+                return False
+            await self._delivery.delete_status(chat_id, message_id)
+            return True
+        except Exception:
+            return False
+
+    async def _send_files(self, chat_id, paths, caption=None):
+        try:
+            if self._delivery is None:
+                raise RuntimeError("Ando receiver is not connected")
+            message_id = await self._delivery.send_files(chat_id, paths, caption)
+            return SendResult(success=True, message_id=message_id)
+        except Exception as exc:
+            # Hermes posts its own "Couldn't deliver" notice for a failed attachment.
+            logger.warning("Ando attachment was not delivered (%s: %s)", type(exc).__name__,
+                           exc if isinstance(exc, AttachmentFailed) else "")
+            return SendResult(
+                success=False,
+                error=f"Ando attachment failed ({type(exc).__name__})",
+                retryable=False,
+            )
+
+    async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None,
+                              metadata=None, **kwargs):
+        return await self._send_files(chat_id, [(image_path, None)], caption)
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None,
+                            reply_to=None, metadata=None, **kwargs):
+        return await self._send_files(chat_id, [(file_path, file_name)], caption)
+
+    async def send_video(self, chat_id, video_path, caption=None, reply_to=None,
+                         metadata=None, **kwargs):
+        return await self._send_files(chat_id, [(video_path, None)], caption)
+
+    async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None,
+                         metadata=None, **kwargs):
+        return await self._send_files(chat_id, [(audio_path, None)], caption)
+
+    async def send_image(self, chat_id, image_url, caption=None, reply_to=None, metadata=None):
+        path = await _local_image(image_url)
+        if path is None:
+            return SendResult(success=False, error="Ando image could not be downloaded",
+                              retryable=False)
+        return await self._send_files(chat_id, [(path, None)], caption)
+
+    async def send_animation(self, chat_id, animation_url, caption=None, reply_to=None,
+                             metadata=None):
+        return await self.send_image(chat_id, animation_url, caption, reply_to, metadata)
+
+    async def send_multiple_images(self, chat_id, images, metadata=None, human_delay=0.0):
+        """One Ando message per batch of up to 10 images. Success when any image was
+        delivered, the aggregate Hermes's turn tracker records (#106153)."""
+        if not images:
+            return SendResult(success=False, error="no images to send")
+        local, failed = [], 0
+        for image_url, alt in images:
+            path = await _local_image(image_url)
+            if path is None:
+                failed += 1
+            else:
+                local.append((path, alt))
+        delivered = False
+        for start in range(0, len(local), MAX_FILES):
+            batch = local[start:start + MAX_FILES]
+            caption = "\n".join(alt for _, alt in batch if alt) or None
+            result = await self._send_files(chat_id, [(path, None) for path, _ in batch], caption)
+            delivered = delivered or result.success
+            failed += 0 if result.success else len(batch)
+        if failed:
+            # Hermes reports a failed batch only in its log; say so where it was asked.
+            await self._warn_images_missing(chat_id, failed, metadata)
+        return SendResult(success=delivered,
+                          error=None if delivered else "all images failed to send")
+
+    async def _warn_images_missing(self, chat_id, count, metadata):
+        text = (failure_text("image/") if count == 1
+                else f"⚠️ Couldn't deliver {count} image attachments.")
+        try:
+            # emit_warning honors the operator's warning-notification setting.
+            warn = getattr(self, "emit_warning", None)
+            if warn is not None:
+                await warn(chat_id, text, metadata=metadata)
+            else:
+                await self.send(chat_id, text, metadata=metadata)
+        except Exception as exc:  # noqa: BLE001 - the images already failed; only log
+            logger.warning("Ando image failure notice was not posted (%s)", type(exc).__name__)
 
     async def get_chat_info(self, chat_id):
         return {"name": "Ando", "type": "dm"}
@@ -319,14 +487,60 @@ class AndoAdapter(BasePlatformAdapter):
             self._state.close()
             self._state = None
         if self._lock_key:
-            from gateway.status import release_scoped_lock
-
             release_scoped_lock("ando", self._lock_key)
             self._lock_key = None
         self._mark_disconnected()
 
 
+async def _cache_media(data, filename, content_type):
+    """(path, media type) in Hermes's cache; older Hermes lacks cache_media_bytes."""
+    from gateway.platforms import base
+
+    cache = getattr(base, "cache_media_bytes_async", None)
+    if cache is not None:
+        cached = await cache(data, filename=filename, mime_type=content_type)
+        return None if cached is None else (cached.path, cached.media_type)
+    if content_type.startswith("image/"):
+        ext = Path(filename).suffix or ".jpg"
+        return await asyncio.to_thread(base.cache_image_from_bytes, data, ext), content_type
+    return (
+        await asyncio.to_thread(base.cache_document_from_bytes, data, filename),
+        content_type,
+    )
+
+
+async def _local_image(url):
+    """A local path for a Hermes image reference: file:// as is, http(s) downloaded."""
+    if url.startswith("file://"):
+        from urllib.request import url2pathname
+
+        return url2pathname(url[7:])
+    try:
+        from gateway.platforms.base import cache_image_from_url
+
+        ext = Path(url.split("?")[0]).suffix.lower()
+        return await cache_image_from_url(
+            url, ext if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"} else ".jpg"
+        )
+    except Exception as exc:  # noqa: BLE001 - SSRF refusal, HTTP error or not an image
+        logger.warning("Hermes image could not be downloaded for Ando (%s)", type(exc).__name__)
+        return None
+
+
 def register(ctx):
+    import inspect
+
+    from gateway.platform_registry import PlatformEntry
+
+    quiet = {}
+    if "display_tier" in inspect.signature(PlatformEntry).parameters:
+        # Low: no tool progress, commentary or heartbeats. Hermes sends tool
+        # progress unmarked, so it would land in the reply outbox as the reply.
+        quiet["display_tier"] = "low"
+    else:
+        logger.warning(
+            "This Hermes predates display tiers (v0.21.6); update Hermes so Ando receives only final replies"
+        )
     ctx.register_platform(
         name="ando",
         label="Ando",
@@ -338,4 +552,5 @@ def register(ctx):
         allow_all_env="ANDO_ALLOW_ALL_USERS",
         max_message_length=0,
         platform_hint="Ando delivers authorized messages; the platform posts your final reply automatically.",
+        **quiet,
     )
