@@ -57,8 +57,9 @@ free on small containers.
 API-key receiving uses an outbound Realtime connection and Ando's direct/updates
 inbox. On startup it subscribes before sweeping pending work, follows every inbox
 and history page, and periodically reconciles without running the model for an
-empty inbox. If the server explicitly reports a resume cursor older than its
-24-hour replay window, invitation mode opens a fresh socket and recovers pending
+empty inbox. Realtime events are acknowledged as soon as they arrive, and a
+dropped or rotated socket reconnects while a running turn finishes. If the
+server explicitly reports a resume cursor older than its 24-hour replay window, invitation mode opens a fresh socket and recovers pending
 work through the inbox before handling queued live events. Delivery/outbox state
 is retained. Authorization errors and legacy realtime-only connections still
 fail closed. Ando's existing permissions and inbox decide which DMs, mentions,

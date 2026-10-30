@@ -22,7 +22,7 @@ from .protocol import (
     verify_workspace_info,
 )
 from .state import DeliveryState
-from .transport import AndoTransport, listen
+from .transport import AndoTransport, listen, receive_inbox
 
 logger = logging.getLogger(__name__)
 
@@ -193,12 +193,17 @@ class AndoAdapter(BasePlatformAdapter):
                     recovery = (
                         InboxRecovery(transport, self._delivery) if invited else None
                     )
-                    retry_after = await listen(
-                        transport,
-                        self._state,
-                        recovery.on_event if recovery else self._delivery.handle,
-                        self._connected,
-                        recover=recovery.sweep if recovery else None,
+                    retry_after = await (
+                        receive_inbox(
+                            transport, self._state, recovery, self._connected
+                        )
+                        if recovery
+                        else listen(
+                            transport,
+                            self._state,
+                            self._delivery.handle,
+                            self._connected,
+                        )
                     )
                 delay = 1
                 self._mark_disconnected()

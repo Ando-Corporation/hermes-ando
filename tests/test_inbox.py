@@ -40,11 +40,11 @@ class Transport(FakeTransport):
         if name == "get_agent_inbox":
             self.sweeps.append(copy.deepcopy(args))
             # Empty first page must still be followed.
-            if args["scope"] == "direct" and "cursor" not in args:
+            if "cursor" not in args:
                 return {"items": [], "page": {"has_more": True, "next_cursor": "next"}}
             return {
                 "items": []
-                if self.archived or args["scope"] == "updates"
+                if self.archived
                 else [copy.deepcopy(ITEM)],
                 "page": {"has_more": False},
             }
@@ -113,8 +113,13 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.state.completed("message:message-1"))
         self.assertTrue(self.state.completed("message:message-2"))
         await self.inbox.on_event(event(message_id="message-1"))
+        # A live event only wakes the worker; its sweep never regenerates.
+        self.assertTrue(self.inbox.wanted.is_set())
+        await self.inbox.sweep()
         self.assertEqual(len(self.turns), 1)
         self.assertEqual(self.transport.sweeps[1]["cursor"], "next")
+        # One default-scope stream: an empty inbox costs one call, not one per scope.
+        self.assertNotIn("scope", self.transport.sweeps[0])
         self.assertTrue(self.transport.archived)
 
     async def test_competing_receiver_never_generates(self):
@@ -266,7 +271,7 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
             if name == "get_agent_inbox" and not self.transport.archived:
                 await original(name, args)
                 return {
-                    "items": [] if args["scope"] == "updates" else [copy.deepcopy(item)],
+                    "items": [copy.deepcopy(item)],
                     "page": {"has_more": False},
                 }
             return await original(name, args)
@@ -287,6 +292,9 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("handled" in line for line in logs.output))
         # The same message arriving live never regenerates.
         await self.inbox.on_event(event(message_id="message-2"))
+        # A live event only wakes the worker; its sweep never regenerates.
+        self.assertTrue(self.inbox.wanted.is_set())
+        await self.inbox.sweep()
         self.assertEqual(len(self.turns), 1)
 
     async def test_message_item_reply_includes_root_and_answers_in_thread(self):

@@ -73,7 +73,7 @@ public commit; catalog upgrades are subsequent reviewed SHA-bump PRs.
 
 Use `tier: community` (Hermes reserves official for NousResearch-maintained
 plugins), `category: platform`, Ando as maintainer, the actual public repo,
-version `0.2.4`, and public documentation URL. Copy the current upstream catalog
+version `0.2.5`, and public documentation URL. Copy the current upstream catalog
 schema rather than assuming all fields below are stable. The proposed entry is
 in `catalog-entry.example.yaml`; replace placeholders after publication.
 

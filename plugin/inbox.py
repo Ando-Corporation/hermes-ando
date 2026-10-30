@@ -2,6 +2,7 @@
 
 Realtime is a wake signal. The inbox remains the authority for which messages
 need attention, and its optional execution claim prevents competing receivers.
+One worker sweeps it; wakes that arrive during a sweep run one more sweep.
 """
 
 import asyncio
@@ -25,37 +26,51 @@ class InboxRecovery:
         self.lock = asyncio.Lock()
         self.owner = transport.connection["receiver_id"]
         self.warned = set()
+        self.wanted = asyncio.Event()
+
+    def wake(self):
+        self.wanted.set()
 
     async def on_event(self, frame):
         message_reference(
             frame, self.delivery.workspace_id, self.delivery.membership_id
         )
-        await self.sweep()
+        # Return at once so the socket acknowledges the wake. Ando closes a
+        # socket whose event goes unacknowledged for 60 seconds, so waiting for
+        # the Hermes turn dropped the connection on every longer turn.
+        self.wake()
+
+    async def run(self):
+        while True:
+            await self.wanted.wait()
+            self.wanted.clear()
+            await self.sweep()
 
     async def sweep(self):
         async with self.lock:
             found = 0
-            for scope in ("direct", "updates"):
-                args = {"scope": scope, "limit": 100}
-                seen = set()
-                while True:
-                    result = await self.transport.call("get_agent_inbox", args)
-                    for item in result["items"]:
-                        if item.get("type") in {
-                            "mention",
-                            "direct_message",
-                            "reply",
-                        } and item.get("message_id"):
-                            found += 1
-                            await self.handle(item)
-                    page = result["page"]
-                    if not page["has_more"]:
-                        break
-                    cursor = page.get("next_cursor")
-                    if not cursor or cursor in seen:
-                        raise SetupRequired("Ando inbox pagination did not advance")
-                    seen.add(cursor)
-                    args = {**args, "cursor": cursor}
+            # The default scope walks direct work, then thread updates, in one
+            # stream, so an empty inbox costs one call rather than one per scope.
+            args = {"limit": 100}
+            seen = set()
+            while True:
+                result = await self.transport.call("get_agent_inbox", args)
+                for item in result["items"]:
+                    if item.get("type") in {
+                        "mention",
+                        "direct_message",
+                        "reply",
+                    } and item.get("message_id"):
+                        found += 1
+                        await self.handle(item)
+                page = result["page"]
+                if not page["has_more"]:
+                    break
+                cursor = page.get("next_cursor")
+                if not cursor or cursor in seen:
+                    raise SetupRequired("Ando inbox pagination did not advance")
+                seen.add(cursor)
+                args = {**args, "cursor": cursor}
             if found:
                 logger.info("Ando inbox sweep processed %d message item(s)", found)
             else:

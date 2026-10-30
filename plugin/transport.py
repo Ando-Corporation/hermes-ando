@@ -6,6 +6,7 @@ secrets stay in Hermes's own manager/storage; none are copied into plugin state.
 """
 
 import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 import json
 import logging
@@ -16,7 +17,13 @@ logger = logging.getLogger(__name__)
 
 # What every connection names itself on MCP initialize; Ando compares it with
 # the published release to tell the installer when to update (plugin.yaml).
-CLIENT_INFO = {"name": "Ando Hermes", "version": "0.2.4"}
+CLIENT_INFO = {"name": "Ando Hermes", "version": "0.2.5"}
+
+# Realtime wakes the agent for its DMs and mentions, and every new socket
+# (at least every 15 minutes) sweeps the inbox, so this reconcile only catches
+# work the socket does not deliver, such as replies in subscribed threads. At
+# 30 seconds it was about half of Ando's production inbox reads (2026-10-17).
+RECONCILE_INTERVAL_SECONDS = 300
 
 
 def websocket_connect(*args, **kwargs):
@@ -288,11 +295,12 @@ async def receive_socket(socket, state, on_event):
     return 0
 
 
-async def listen(transport, state, on_event, on_connected, recover=None):
+async def listen(transport, state, on_event, on_connected, wake=None):
+    """One realtime connection. Inbox receivers pass wake, called once subscribed."""
     try:
         ticket = await transport.ticket(state.get("cursor"))
     except ReplayExpired:
-        if recover is None or transport.connection is None:
+        if wake is None or transport.connection is None:
             # Legacy realtime-only receivers have no authoritative inbox sweep.
             raise
         # Invitation inbox claims/history remain the authority for pending work.
@@ -320,30 +328,57 @@ async def listen(transport, state, on_event, on_connected, recover=None):
         )
         # Subscribe before sweeping: new arrivals are queued on this socket while
         # the inbox covers work from before the ticket floor. IDs deduplicate overlap.
-        if recover:
-            await recover()
-        if recover is None:
-            return await receive_socket(socket, state, on_event)
+        if wake:
+            wake()
+        return await receive_socket(socket, state, on_event)
 
-        async def reconcile():
-            while True:
-                await asyncio.sleep(30)
-                await recover()
 
-        reader = asyncio.create_task(receive_socket(socket, state, on_event))
-        sweeper = asyncio.create_task(reconcile())
-        try:
-            done, _ = await asyncio.wait(
-                [reader, sweeper], return_when=asyncio.FIRST_COMPLETED
+async def receive_inbox(transport, state, inbox, on_connected):
+    """Invitation receiving: realtime wakes one inbox worker that outlives sockets.
+
+    Ando rotates sockets at least every 15 minutes and closes one whose event
+    stays unacknowledged for a minute. A socket that drops mid-turn reconnects
+    here while the worker finishes the turn and keeps sweeping, so a reconnect
+    never abandons a reply or leaves the inbox unread. Returns only by raising.
+    """
+
+    async def reconcile():
+        while True:
+            await asyncio.sleep(RECONCILE_INTERVAL_SECONDS)
+            inbox.wake()
+
+    worker = asyncio.create_task(inbox.run())
+    sweeper = asyncio.create_task(reconcile())
+    reader = None
+    delay = 1
+    try:
+        while True:
+            reader = asyncio.create_task(
+                listen(transport, state, inbox.on_event, on_connected, inbox.wake)
             )
-            if sweeper in done:
-                await sweeper
-            return await reader
-        finally:
-            import contextlib
-
-            for task in (reader, sweeper):
-                task.cancel()
-            for task in (reader, sweeper):
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            await asyncio.wait([worker, reader], return_when=asyncio.FIRST_COMPLETED)
+            if worker.done():
+                await worker
+                raise RuntimeError("Ando inbox worker stopped")
+            try:
+                retry_after = reader.result()
+                delay = 1
+            except SetupRequired:
+                raise
+            except Exception as exc:
+                retry_after = delay
+                delay = min(delay * 2, 60)
+                logger.warning(
+                    "Ando realtime dropped; reconnecting in %s seconds while the inbox worker continues (%s)",
+                    retry_after,
+                    type(exc).__name__,
+                )
+            await asyncio.wait([worker], timeout=retry_after)
+    finally:
+        tasks = [task for task in (reader, worker, sweeper) if task is not None]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            # A failed task's error already propagated above.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task

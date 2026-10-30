@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -113,12 +114,11 @@ class ReplayRecoveryTests(unittest.IsolatedAsyncioTestCase):
         context.__aenter__ = AsyncMock(return_value=socket)
         context.__aexit__ = AsyncMock(return_value=False)
         order = []
-        async def recover():
-            order.append("recover")
         with patch("plugin.transport.websocket_connect", return_value=context):
-            await listen(transport, state, AsyncMock(), lambda: order.append("connected"), recover)
+            await listen(transport, state, AsyncMock(), lambda: order.append("connected"),
+                         lambda: order.append("wake"))
         self.assertEqual(calls, ["old", None])
-        self.assertEqual(order, ["connected", "recover"])
+        self.assertEqual(order, ["connected", "wake"])
         state.set.assert_called_once_with("cursor", "fresh")
 
     async def test_no_inbox_or_no_invitation_does_not_skip_expired_replay(self):
@@ -178,3 +178,107 @@ class ReplayRecoveryTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(SetupRequired) as result:
                 await transport.ticket("old")
             self.assertNotIsInstance(result.exception, ReplayExpired)
+
+
+class FakeSocket:
+    """Yields scripted frames, then drops like a server-closed socket."""
+
+    subprotocol = "ando.realtime.v1"
+
+    def __init__(self, frames, sent):
+        self.frames = list(frames)
+        self.sent = sent
+        self.drop = asyncio.Event()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.frames:
+            return json.dumps(self.frames.pop(0))
+        await self.drop.wait()
+        raise ConnectionError("server closed the socket")
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw)["envelope_id"])
+
+
+class InboxReconnectTests(unittest.IsolatedAsyncioTestCase):
+    """A long Hermes turn must survive the socket dropping under it."""
+
+    async def test_socket_drop_mid_turn_reconnects_without_abandoning_the_turn(self):
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock, MagicMock
+        from plugin.inbox import InboxRecovery
+        from plugin.transport import receive_inbox
+        from test_delivery import event
+
+        sent = []
+        sockets = [FakeSocket([event()], sent), FakeSocket([], sent)]
+        opened = []
+
+        @asynccontextmanager
+        async def connect(*args, **kwargs):
+            socket = sockets[len(opened)]
+            opened.append(socket)
+            yield socket
+
+        transport = MagicMock(connection={"receiver_id": "receiver"})
+        transport.ticket = AsyncMock(return_value={"url": "wss://x", "resume_cursor": "floor"})
+        delivery = MagicMock(workspace_id="workspace", membership_id="agent")
+        inbox = InboxRecovery(transport, delivery)
+        turn = asyncio.Event()
+        sweeps = []
+
+        async def sweep():
+            sweeps.append("started")
+            if len(sweeps) == 1:  # a turn longer than the socket lives
+                await turn.wait()
+            sweeps.append("finished")
+
+        inbox.sweep = sweep
+        with patch("plugin.transport.websocket_connect", connect):
+            receiver = asyncio.create_task(
+                receive_inbox(transport, MagicMock(), inbox, lambda: None)
+            )
+            while not (sent and sweeps):
+                await asyncio.sleep(0)
+            # The event is acknowledged while its turn is still running.
+            self.assertEqual(sent, ["envelope-event-1"])
+            self.assertEqual(sweeps, ["started"])
+            opened[0].drop.set()
+            while len(opened) < 2:
+                await asyncio.sleep(0.01)
+            # The socket reconnected; the turn was not cancelled with it.
+            self.assertEqual(sweeps, ["started"])
+            turn.set()
+            # The new socket's wake sweeps the inbox again after the turn.
+            while len(sweeps) < 4:
+                await asyncio.sleep(0)
+            self.assertEqual(sweeps, ["started", "finished", "started", "finished"])
+            receiver.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await receiver
+
+    async def test_inbox_worker_failure_stops_receiving(self):
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock, MagicMock
+        from plugin.inbox import InboxRecovery
+        from plugin.protocol import SetupRequired
+        from plugin.transport import receive_inbox
+
+        socket = FakeSocket([], [])
+
+        @asynccontextmanager
+        async def connect(*args, **kwargs):
+            yield socket
+
+        transport = MagicMock(connection={"receiver_id": "receiver"})
+        transport.ticket = AsyncMock(return_value={"url": "wss://x", "resume_cursor": "floor"})
+        inbox = InboxRecovery(transport, MagicMock(workspace_id="workspace", membership_id="agent"))
+        inbox.sweep = AsyncMock(side_effect=SetupRequired("execution conflict"))
+        with patch("plugin.transport.websocket_connect", connect):
+            with self.assertRaises(SetupRequired):
+                await asyncio.wait_for(
+                    receive_inbox(transport, MagicMock(), inbox, lambda: None), 5
+                )
