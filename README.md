@@ -79,6 +79,11 @@ channel restriction. Restart the gateway after changing these settings.
 Admitted senders can run the configured Hermes tools on your host; widen access
 only to members you intend to grant that capability. Ando permissions still apply.
 
+When a turn waits for command approval, the member who connected the agent can
+answer in the same Ando conversation with `/approve`, `/deny`, or a bare
+`approve`, `approve always`, `yes`, `deny` or `no`. Ando messages never run other
+Hermes gateway commands, and a reply from anyone else waits for the turn.
+
 The backend must support the optional `execution_id` field on
 `acknowledge_agent_inbox_item`. The plugin refuses to generate until Ando confirms
 its durable claim. A different receiver cannot acquire or acknowledge that work,

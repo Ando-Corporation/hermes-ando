@@ -315,6 +315,46 @@ class HermesContractTests(unittest.IsolatedAsyncioTestCase):
         await self.adapter._delivery.handle(frame)
         self.assertEqual(seen, [False])
 
+    async def test_approval_reply_resolves_the_blocked_turn_in_its_session(self):
+        from tools.approval import _gateway_queues, _lock, resolve_gateway_approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+
+        self.adapter.config.extra["installer_id"] = "human"
+        waiting = asyncio.Event()
+        entry = _ApprovalEntry({"command": "send email"})
+        commands = []
+
+        async def handler(incoming):
+            key = self.adapter._event_session_key(incoming)
+            if incoming.text.startswith("/approve"):
+                # Hermes's own /approve, reached past the busy session.
+                self.assertTrue(incoming.allow_gateway_control)
+                commands.append(incoming.text)
+                resolve_gateway_approval(key, "once")
+                return "Approved"
+            self.assertFalse(incoming.allow_gateway_control)
+            with _lock:
+                _gateway_queues.setdefault(key, []).append(entry)
+            waiting.set()
+            await asyncio.to_thread(entry.event.wait, 5)
+            return "Sent" if entry.result == "once" else "Timed out"
+
+        self.adapter.set_message_handler(handler)
+        turn = asyncio.create_task(self.adapter._delivery.handle(event()))
+        await asyncio.wait_for(waiting.wait(), 5)
+        reply = {"id": "m2", "conversation_id": "conversation", "content": "approve"}
+        ref = {"message_id": "m2", "conversation_id": "conversation", "author_id": "human"}
+        self.assertIsNone(await self.adapter._approval({**ref, "author_id": "other"}, reply))
+        answer = await self.adapter._approval(ref, reply)
+        self.assertIsNotNone(answer)
+        await asyncio.wait_for(answer(), 5)
+        await asyncio.wait_for(turn, 5)
+        self.assertEqual(commands, ["/approve"])
+        replies = [args for _, _, args, _ in self.state.replies("event-1")]
+        # The confirmation is a status line; only the turn's answer is its reply.
+        self.assertEqual([r["markdown_content"] for r in replies], ["Sent"])
+        self.assertIsNone(await self.adapter._approval(ref, reply))
+
 
 if __name__ == "__main__":
     unittest.main()

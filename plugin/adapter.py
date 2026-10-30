@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from .files import AttachmentFailed, MAX_FILES, missing_note
 from .media import failure_text, message_type
 from .protocol import (
     SetupRequired,
+    approval_command,
     lock_acquired,
     release_scoped_lock,
     verify_identity,
@@ -25,6 +27,10 @@ from .state import DeliveryState
 from .transport import AndoTransport, listen, receive_inbox
 
 logger = logging.getLogger(__name__)
+
+# Set while Hermes answers an approval reply, so its confirmation is posted as
+# a status line rather than becoming part of the blocked turn's reply.
+_answering_approval = contextvars.ContextVar("ando_answering_approval", default=False)
 
 
 def local_allowed_users(extra):
@@ -191,7 +197,9 @@ class AndoAdapter(BasePlatformAdapter):
                     from .inbox import InboxRecovery
 
                     recovery = (
-                        InboxRecovery(transport, self._delivery) if invited else None
+                        InboxRecovery(transport, self._delivery, self._approval)
+                        if invited
+                        else None
                     )
                     retry_after = await (
                         receive_inbox(
@@ -244,6 +252,65 @@ class AndoAdapter(BasePlatformAdapter):
             if found:
                 return found
         return None
+
+    async def _approval(self, ref, message):
+        """Answer for a reply that resolves the running turn's pending approval.
+
+        Only the member who connected this agent can approve, only in the
+        conversation of the turn that asked, and only while Hermes is actually
+        waiting; anything else stays an ordinary message for the next turn.
+        """
+        active = self._delivery.active if self._delivery else None
+        command = approval_command(message.get("content"))
+        if (
+            command is None
+            or active is None
+            or ref["conversation_id"] != active["conversation_id"]
+            or ref["author_id"] != self.extra["installer_id"]
+        ):
+            return None
+        source = SessionSource(
+            platform=Platform("ando"),
+            chat_id=self._delivery.chat_id(active),
+            chat_name=message.get("conversation_name"),
+            chat_type="dm" if active["kind"] == "direct_message" else "channel",
+            user_id=ref["author_id"],
+            user_name=message.get("author_name"),
+            # The turn's own thread, so the reply finds the turn's session.
+            thread_id=active["thread_id"],
+            scope_id=self.extra["workspace_id"],
+            message_id=ref["message_id"],
+            role_authorized=True,
+        )
+        event = MessageEvent(
+            text=command,
+            message_type=MessageType.TEXT,
+            source=source,
+            user_id=source.user_id,
+            user_name=source.user_name,
+            message_id=ref["message_id"],
+            raw_message={"ando_event_id": f"message:{ref['message_id']}"},
+            # Hermes routes only /approve and /deny past the busy session.
+            allow_gateway_control=True,
+        )
+        try:
+            from tools.approval import has_blocking_approval
+
+            waiting = has_blocking_approval(self._event_session_key(event))
+        except (ImportError, AttributeError):
+            # An older Hermes: the reply waits for the turn, as before.
+            waiting = False
+        if not waiting:
+            return None
+
+        async def answer():
+            token = _answering_approval.set(True)
+            try:
+                await self.handle_message(event)
+            finally:
+                _answering_approval.reset(token)
+
+        return answer
 
     async def _dispatch(self, ref, message, disabled_names):
         if not self._message_handler:
@@ -332,7 +399,7 @@ class AndoAdapter(BasePlatformAdapter):
         try:
             if self._delivery is None:
                 raise RuntimeError("Ando receiver is not connected")
-            if (metadata or {}).get("_interim_send"):
+            if (metadata or {}).get("_interim_send") or _answering_approval.get():
                 # Hermes marks heartbeats and other mid-turn notes as interim.
                 message_id = await self._delivery.send_status(chat_id, content)
             else:

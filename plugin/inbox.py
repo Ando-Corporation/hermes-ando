@@ -20,16 +20,88 @@ SUPPORTED_RECOVERY_TOOLS = {"get_message", "get_messages_by_time_range"}
 
 
 class InboxRecovery:
-    def __init__(self, transport, delivery):
+    def __init__(self, transport, delivery, approval=None):
         self.transport = transport
         self.delivery = delivery
+        # approval(ref, message) returns an async answer for a reply that
+        # resolves the running turn's pending approval, else None.
+        self.approval = approval
         self.lock = asyncio.Lock()
         self.owner = transport.connection["receiver_id"]
         self.warned = set()
         self.wanted = asyncio.Event()
+        self.approvals_task = None
 
     def wake(self):
         self.wanted.set()
+        if (
+            self.approval
+            and self.lock.locked()
+            and self.delivery.active
+            and (self.approvals_task is None or self.approvals_task.done())
+        ):
+            # The worker is inside a turn that may be blocked waiting for the
+            # member to approve a command. Their reply cannot wait for that
+            # turn to finish, so look for it beside the worker.
+            self.approvals_task = asyncio.create_task(self.answer_approvals())
+
+    async def answer_approvals(self):
+        active = self.delivery.active
+        try:
+            args = {"limit": 100}
+            seen = set()
+            while True:
+                result = await self.transport.call("get_agent_inbox", args)
+                for item in result["items"]:
+                    if (
+                        item.get("type") in {"mention", "direct_message", "reply"}
+                        and item.get("message_id")
+                        and item.get("revision")
+                        and item.get("conversation_id") == active["conversation_id"]
+                        and item["message_id"] != active["message_id"]
+                    ):
+                        await self.answer_approval(item)
+                page = result["page"]
+                cursor = page.get("next_cursor")
+                if not page["has_more"] or not cursor or cursor in seen:
+                    return
+                seen.add(cursor)
+                args = {**args, "cursor": cursor}
+        except Exception as exc:  # noqa: BLE001 - the worker's next sweep still owns the item
+            logger.warning(
+                "Ando approval reply check failed (%s); the next sweep handles it",
+                type(exc).__name__,
+            )
+
+    async def answer_approval(self, item):
+        key = f"message:{item['message_id']}"
+        if self.delivery.state.completed(key):
+            return
+        response = await self.transport.call(
+            "get_message", {"message_id": item["message_id"]}
+        )
+        message = response.get("data", response)
+        if message.get("id") != item["message_id"] or message.get(
+            "conversation_id"
+        ) != item["conversation_id"]:
+            return
+        ref = {
+            "message_id": item["message_id"],
+            "conversation_id": item["conversation_id"],
+            "author_id": message.get("authorWorkspaceMembershipId"),
+        }
+        answer = await self.approval(ref, message)
+        if answer is None:
+            return
+        revision = await self.acknowledge(item, "in_progress", item["revision"])
+        if revision is None:
+            return
+        await answer()
+        self.delivery.state.complete(key)
+        await self.acknowledge(item, "handled", revision)
+        logger.info(
+            "Ando message %s answered the running turn's approval", item["message_id"]
+        )
 
     async def on_event(self, frame):
         message_reference(

@@ -330,3 +330,127 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(logs.output), 1)
         self.assertIn("get_future_context", logs.output[0])
+
+
+class ApprovalTransport(FakeTransport):
+    """Two inbox items: a request whose turn blocks on approval, then the reply."""
+
+    def __init__(self):
+        super().__init__()
+        self.connection = {"receiver_id": OWNER}
+        self.handled = set()
+        self.content = {"message-1": "Send the email", "message-2": "/approve"}
+
+    async def call(self, name, args):
+        if name == "get_agent_inbox":
+            items = [
+                {
+                    "event_id": f"inbox-{n}",
+                    "revision": "r1",
+                    "type": "direct_message",
+                    "conversation_id": "conversation",
+                    "message_id": f"message-{n}",
+                    "thread_root_message_id": None,
+                    "recovery": {"tool": "get_message", "arguments": {}},
+                }
+                for n in (1, 2)
+                if f"inbox-{n}" not in self.handled
+            ]
+            return {"items": items, "page": {"has_more": False}}
+        if name == "acknowledge_agent_inbox_item":
+            self.calls.append((name, copy.deepcopy(args)))
+            if args["state"] == "handled":
+                self.handled.add(args["event_id"])
+            return {"status": "acknowledged", "execution_id": OWNER, "current_revision": "r2"}
+        if name == "get_message":
+            self.calls.append((name, copy.deepcopy(args)))
+            return {
+                "data": {
+                    "id": args["message_id"],
+                    "conversation_id": "conversation",
+                    "authorWorkspaceMembershipId": "human",
+                    "content": self.content[args["message_id"]],
+                }
+            }
+        return await super().call(name, args)
+
+
+class ApprovalReplyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = DeliveryState(Path(self.tmp.name) / "state.sqlite3", "workspace", "agent")
+
+    def tearDown(self):
+        self.state.close()
+        self.tmp.cleanup()
+
+    async def test_reply_reaches_a_turn_blocked_on_approval(self):
+        import asyncio
+        from plugin.protocol import approval_command
+
+        transport = ApprovalTransport()
+        approved = asyncio.Event()
+        turns = []
+
+        async def dispatch(ref, message, disabled):
+            turns.append(message["content"])
+            inbox.wake()  # the member's reply arrives while Hermes waits
+            await asyncio.wait_for(approved.wait(), 5)
+            await delivery.send(delivery.chat_id(ref), "Sent")
+
+        async def approval(ref, message):
+            if approval_command(message["content"]) is None:
+                return None
+
+            async def answer():
+                approved.set()
+
+            return answer
+
+        delivery = MessageDelivery(
+            transport, self.state, "workspace", "agent", ["human"], dispatch,
+            credential_mode="invitation",
+        )
+        inbox = InboxRecovery(transport, delivery, approval)
+        await inbox.sweep()
+        # One turn, for the request; the approval never started its own.
+        self.assertEqual(turns, ["Send the email"])
+        self.assertEqual(transport.handled, {"inbox-1", "inbox-2"})
+        self.assertTrue(self.state.completed("message:message-2"))
+
+    async def test_ordinary_reply_waits_for_the_turn(self):
+        import asyncio
+
+        transport = ApprovalTransport()
+        transport.content["message-2"] = "also cc Dana"
+        asked = []
+
+        async def dispatch(ref, message, disabled):
+            asked.append(message["content"])
+            if len(asked) == 1:
+                inbox.wake()
+                await asyncio.sleep(0.05)
+            await delivery.send(delivery.chat_id(ref), "Done")
+
+        async def approval(ref, message):
+            return None
+
+        delivery = MessageDelivery(
+            transport, self.state, "workspace", "agent", ["human"], dispatch,
+            credential_mode="invitation",
+        )
+        inbox = InboxRecovery(transport, delivery, approval)
+        await inbox.sweep()
+        self.assertEqual(asked, ["Send the email", "also cc Dana"])
+
+
+class ApprovalCommandTests(unittest.TestCase):
+    def test_only_approval_replies_become_commands(self):
+        from plugin.protocol import approval_command
+
+        self.assertEqual(approval_command("approve"), "/approve")
+        self.assertEqual(approval_command(" Approve  always "), "/approve always")
+        self.assertEqual(approval_command("/approve"), "/approve")
+        self.assertEqual(approval_command("/deny too risky"), "/deny too risky")
+        for text in (None, "", "approve it please", "/restart", "yes, but later"):
+            self.assertIsNone(approval_command(text))

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # What every connection names itself on MCP initialize; Ando compares it with
 # the published release to tell the installer when to update (plugin.yaml).
-CLIENT_INFO = {"name": "Ando Hermes", "version": "0.2.5"}
+CLIENT_INFO = {"name": "Ando Hermes", "version": "0.2.6"}
 
 # Realtime wakes the agent for its DMs and mentions, and every new socket
 # (at least every 15 minutes) sweeps the inbox, so this reconcile only catches

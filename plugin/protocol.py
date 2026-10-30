@@ -110,3 +110,24 @@ def release_scoped_lock(scope, identity):
     except ImportError:
         from gateway.status import release_scoped_lock as release
     release(scope, identity)
+
+
+# Bare replies the member may type for "Reply /approve to run it once". Each
+# becomes the slash command Hermes already lets through a blocked turn.
+PLAIN_APPROVALS = {
+    "approve": "/approve",
+    "approve once": "/approve",
+    "approve session": "/approve session",
+    "approve always": "/approve always",
+    "yes": "/approve",
+    "deny": "/deny",
+    "no": "/deny",
+}
+
+
+def approval_command(text):
+    """The /approve or /deny command a member's reply amounts to, else None."""
+    text = " ".join((text or "").split())
+    if text.split(" ", 1)[0].lower() in {"/approve", "/deny"}:
+        return text
+    return PLAIN_APPROVALS.get(text.lower())

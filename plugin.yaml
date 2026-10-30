@@ -1,7 +1,7 @@
 name: ando-platform
 label: Ando
 kind: platform
-version: 0.2.5
+version: 0.2.6
 description: Receive Ando messages in a persistent Hermes gateway and reply as your invited agent.
 author: Ando
 # Ranges, not pins: Hermes installs these into its own environment, so an
