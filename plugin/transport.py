@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # What every connection names itself on MCP initialize; Ando compares it with
 # the published release to tell the installer when to update (plugin.yaml).
-CLIENT_INFO = {"name": "Ando Hermes", "version": "0.2.6"}
+CLIENT_INFO = {"name": "Ando Hermes", "version": "0.2.7"}
 
 # Realtime wakes the agent for its DMs and mentions, and every new socket
 # (at least every 15 minutes) sweeps the inbox, so this reconcile only catches
@@ -375,7 +375,11 @@ async def receive_inbox(transport, state, inbox, on_connected):
                 )
             await asyncio.wait([worker], timeout=retry_after)
     finally:
-        tasks = [task for task in (reader, worker, sweeper) if task is not None]
+        tasks = [
+            task
+            for task in (reader, worker, sweeper, inbox.approvals_task)
+            if task is not None
+        ]
         for task in tasks:
             task.cancel()
         for task in tasks:

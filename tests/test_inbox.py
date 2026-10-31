@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import copy
 import json
 from pathlib import Path
@@ -333,28 +335,28 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ApprovalTransport(FakeTransport):
-    """Two inbox items: a request whose turn blocks on approval, then the reply."""
+    """Inbox items in order: a request whose turn blocks on approval, then replies."""
 
-    def __init__(self):
+    def __init__(self, content):
         super().__init__()
         self.connection = {"receiver_id": OWNER}
         self.handled = set()
-        self.content = {"message-1": "Send the email", "message-2": "/approve"}
+        self.content = dict(content)
 
     async def call(self, name, args):
         if name == "get_agent_inbox":
             items = [
                 {
-                    "event_id": f"inbox-{n}",
+                    "event_id": f"inbox-{message_id}",
                     "revision": "r1",
                     "type": "direct_message",
                     "conversation_id": "conversation",
-                    "message_id": f"message-{n}",
+                    "message_id": message_id,
                     "thread_root_message_id": None,
                     "recovery": {"tool": "get_message", "arguments": {}},
                 }
-                for n in (1, 2)
-                if f"inbox-{n}" not in self.handled
+                for message_id in self.content
+                if f"inbox-{message_id}" not in self.handled
             ]
             return {"items": items, "page": {"has_more": False}}
         if name == "acknowledge_agent_inbox_item":
@@ -379,31 +381,52 @@ class ApprovalReplyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.state = DeliveryState(Path(self.tmp.name) / "state.sqlite3", "workspace", "agent")
+        self.approved = asyncio.Event()
+        self.turns = []
+        self.answers = []
 
     def tearDown(self):
         self.state.close()
         self.tmp.cleanup()
 
-    async def test_reply_reaches_a_turn_blocked_on_approval(self):
-        import asyncio
+    def receiver(
+        self, transport, reply_after_prompt=None, wait=5, more_replies=(), next_prompt_reply=None
+    ):
         from plugin.protocol import approval_command
 
-        transport = ApprovalTransport()
-        approved = asyncio.Event()
-        turns = []
-
         async def dispatch(ref, message, disabled):
-            turns.append(message["content"])
-            inbox.wake()  # the member's reply arrives while Hermes waits
-            await asyncio.wait_for(approved.wait(), 5)
-            await delivery.send(delivery.chat_id(ref), "Sent")
+            self.turns.append(message["content"])
+            if len(self.turns) == 1:
+                # Hermes posts its approval prompt and the member answers at
+                # once, before the prompt is even armed.
+                async def post():
+                    if reply_after_prompt:
+                        transport.content["message-3"] = reply_after_prompt
+                    for index, reply in enumerate(more_replies, 4):
+                        transport.content[f"message-{index}"] = reply
+
+                await inbox.arm_approvals(post)
+                inbox.wake()
+                inbox.wake()  # a second wake during the scan is not lost
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self.approved.wait(), wait)
+            await delivery.send(delivery.chat_id(ref), "Done")
 
         async def approval(ref, message):
             if approval_command(message["content"]) is None:
                 return None
 
             async def answer():
-                approved.set()
+                self.answers.append(message["content"])
+                if next_prompt_reply and len(self.answers) == 1:
+                    # Hermes runs on and posts its next prompt, which the
+                    # member answers, before this answer returns.
+                    async def post():
+                        transport.content["message-9"] = next_prompt_reply
+
+                    await inbox.arm_approvals(post)
+                    return
+                self.approved.set()
 
             return answer
 
@@ -412,36 +435,54 @@ class ApprovalReplyTests(unittest.IsolatedAsyncioTestCase):
             credential_mode="invitation",
         )
         inbox = InboxRecovery(transport, delivery, approval)
-        await inbox.sweep()
+        return inbox
+
+    async def test_reply_after_the_prompt_reaches_the_blocked_turn(self):
+        transport = ApprovalTransport({"message-1": "Send the email"})
+        await self.receiver(transport, reply_after_prompt="/approve").sweep()
         # One turn, for the request; the approval never started its own.
-        self.assertEqual(turns, ["Send the email"])
-        self.assertEqual(transport.handled, {"inbox-1", "inbox-2"})
-        self.assertTrue(self.state.completed("message:message-2"))
+        self.assertEqual(self.turns, ["Send the email"])
+        self.assertTrue(self.approved.is_set())
+        self.assertEqual(transport.handled, {"inbox-message-1", "inbox-message-3"})
+        self.assertTrue(self.state.completed("message:message-3"))
+
+    async def test_one_prompt_takes_one_reply(self):
+        # Two approvals queued for one prompt. Hermes then waits on a second
+        # command without posting a prompt Ando saw; "yes" must not approve it.
+        transport = ApprovalTransport({"message-1": "Send the email"})
+        inbox = self.receiver(
+            transport, reply_after_prompt="/approve", more_replies=("yes",)
+        )
+        await inbox.sweep()
+        self.assertEqual(self.answers, ["/approve"])
+        # The extra "yes" is answered as an ordinary message after the turn.
+        await inbox.sweep()
+        self.assertEqual(self.turns, ["Send the email", "yes"])
+
+    async def test_next_prompt_posted_during_an_answer_takes_its_reply(self):
+        transport = ApprovalTransport({"message-1": "Send the email"})
+        await self.receiver(
+            transport, reply_after_prompt="/approve", next_prompt_reply="/deny"
+        ).sweep()
+        self.assertEqual(self.answers, ["/approve", "/deny"])
+        self.assertEqual(self.turns, ["Send the email"])
+
+    async def test_reply_waiting_before_the_prompt_never_approves(self):
+        transport = ApprovalTransport({"message-1": "Send the email", "message-2": "yes"})
+        await self.receiver(transport, wait=0.05).sweep()
+        self.assertFalse(self.approved.is_set())
+        # The earlier "yes" is answered as an ordinary message after the turn.
+        self.assertEqual(self.turns, ["Send the email", "yes"])
 
     async def test_ordinary_reply_waits_for_the_turn(self):
-        import asyncio
-
-        transport = ApprovalTransport()
-        transport.content["message-2"] = "also cc Dana"
-        asked = []
-
-        async def dispatch(ref, message, disabled):
-            asked.append(message["content"])
-            if len(asked) == 1:
-                inbox.wake()
-                await asyncio.sleep(0.05)
-            await delivery.send(delivery.chat_id(ref), "Done")
-
-        async def approval(ref, message):
-            return None
-
-        delivery = MessageDelivery(
-            transport, self.state, "workspace", "agent", ["human"], dispatch,
-            credential_mode="invitation",
-        )
-        inbox = InboxRecovery(transport, delivery, approval)
+        transport = ApprovalTransport({"message-1": "Send the email"})
+        inbox = self.receiver(transport, reply_after_prompt="also cc Dana", wait=0.05)
         await inbox.sweep()
-        self.assertEqual(asked, ["Send the email", "also cc Dana"])
+        self.assertFalse(self.approved.is_set())
+        # Its wake runs the worker's next sweep, which answers it in its own turn.
+        self.assertTrue(inbox.wanted.is_set())
+        await inbox.sweep()
+        self.assertEqual(self.turns, ["Send the email", "also cc Dana"])
 
 
 class ApprovalCommandTests(unittest.TestCase):

@@ -95,6 +95,7 @@ class AndoAdapter(BasePlatformAdapter):
         self._delivery = None
         self._state = None
         self._lock_key = None
+        self._recovery = None
 
     @property
     def name(self):
@@ -201,6 +202,7 @@ class AndoAdapter(BasePlatformAdapter):
                         if invited
                         else None
                     )
+                    self._recovery = recovery
                     retry_after = await (
                         receive_inbox(
                             transport, self._state, recovery, self._connected
@@ -399,7 +401,14 @@ class AndoAdapter(BasePlatformAdapter):
         try:
             if self._delivery is None:
                 raise RuntimeError("Ando receiver is not connected")
-            if (metadata or {}).get("_interim_send") or _answering_approval.get():
+            if (metadata or {}).get("is_approval_prompt"):
+                # Not the turn's reply. Armed around posting, so only a reply
+                # the member sends after seeing it can approve.
+                post = lambda: self._delivery.send_status(chat_id, content)
+                message_id = await (
+                    self._recovery.arm_approvals(post) if self._recovery else post()
+                )
+            elif (metadata or {}).get("_interim_send") or _answering_approval.get():
                 # Hermes marks heartbeats and other mid-turn notes as interim.
                 message_id = await self._delivery.send_status(chat_id, content)
             else:

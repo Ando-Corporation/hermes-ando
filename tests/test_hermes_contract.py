@@ -335,6 +335,12 @@ class HermesContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(incoming.allow_gateway_control)
             with _lock:
                 _gateway_queues.setdefault(key, []).append(entry)
+            # Hermes's text prompt, marked as one, is not the turn's reply.
+            await self.adapter.send(
+                self.adapter._delivery.chat_id(self.adapter._delivery.active),
+                "Reply /approve to run it once",
+                metadata={"is_approval_prompt": True},
+            )
             waiting.set()
             await asyncio.to_thread(entry.event.wait, 5)
             return "Sent" if entry.result == "once" else "Timed out"
@@ -351,7 +357,7 @@ class HermesContractTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(turn, 5)
         self.assertEqual(commands, ["/approve"])
         replies = [args for _, _, args, _ in self.state.replies("event-1")]
-        # The confirmation is a status line; only the turn's answer is its reply.
+        # The prompt and confirmation are status lines; only the answer is the reply.
         self.assertEqual([r["markdown_content"] for r in replies], ["Sent"])
         self.assertIsNone(await self.adapter._approval(ref, reply))
 

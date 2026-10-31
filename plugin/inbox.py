@@ -31,52 +31,94 @@ class InboxRecovery:
         self.warned = set()
         self.wanted = asyncio.Event()
         self.approvals_task = None
+        self.approvals_wanted = False
+        # Set when Hermes posts an approval prompt: the turn it belongs to and
+        # the replies already waiting then, which cannot be answers to it.
+        self.armed = None
 
     def wake(self):
         self.wanted.set()
-        if (
-            self.approval
-            and self.lock.locked()
-            and self.delivery.active
-            and (self.approvals_task is None or self.approvals_task.done())
-        ):
-            # The worker is inside a turn that may be blocked waiting for the
-            # member to approve a command. Their reply cannot wait for that
-            # turn to finish, so look for it beside the worker.
+        if self.armed is None or not self.lock.locked() or not self.delivery.active:
+            return
+        # The worker is inside a turn blocked waiting for the member to approve
+        # a command. Their reply cannot wait for that turn, so look beside it.
+        self.approvals_wanted = True
+        if self.approvals_task is None or self.approvals_task.done():
             self.approvals_task = asyncio.create_task(self.answer_approvals())
 
-    async def answer_approvals(self):
+    async def pending_replies(self, conversation_id):
+        """Message items waiting in one conversation, across every inbox page."""
+        args = {"limit": 100}
+        seen = set()
+        items = []
+        while True:
+            result = await self.transport.call("get_agent_inbox", args)
+            items += [
+                item
+                for item in result["items"]
+                if item.get("type") in {"mention", "direct_message", "reply"}
+                and item.get("message_id")
+                and item.get("revision")
+                and item.get("conversation_id") == conversation_id
+            ]
+            page = result["page"]
+            cursor = page.get("next_cursor")
+            if not page["has_more"] or not cursor or cursor in seen:
+                return items
+            seen.add(cursor)
+            args = {**args, "cursor": cursor}
+
+    async def arm_approvals(self, post):
+        """Post Hermes's approval prompt so only replies sent after it can answer.
+
+        The replies already waiting are read before the prompt is posted, so a
+        member's quick answer can never land among them.
+        """
         active = self.delivery.active
+        if self.approval is None or active is None:
+            return await post()
+        self.armed = None
         try:
-            args = {"limit": 100}
-            seen = set()
-            while True:
-                result = await self.transport.call("get_agent_inbox", args)
-                for item in result["items"]:
-                    if (
-                        item.get("type") in {"mention", "direct_message", "reply"}
-                        and item.get("message_id")
-                        and item.get("revision")
-                        and item.get("conversation_id") == active["conversation_id"]
-                        and item["message_id"] != active["message_id"]
-                    ):
-                        await self.answer_approval(item)
-                page = result["page"]
-                cursor = page.get("next_cursor")
-                if not page["has_more"] or not cursor or cursor in seen:
+            waiting = await self.pending_replies(active["conversation_id"])
+        except Exception as exc:  # noqa: BLE001 - unarmed, replies wait for the turn
+            logger.warning(
+                "Ando could not prepare approval replies (%s); they wait for the turn",
+                type(exc).__name__,
+            )
+            return await post()
+        posted = await post()
+        self.armed = (active["event_id"], {item["message_id"] for item in waiting})
+        # A reply can arrive before the prompt is armed; look once now.
+        self.wake()
+        return posted
+
+    async def answer_approvals(self):
+        try:
+            while self.approvals_wanted:
+                self.approvals_wanted = False
+                active = self.delivery.active
+                armed = self.armed
+                if active is None or armed is None or armed[0] != active["event_id"]:
                     return
-                seen.add(cursor)
-                args = {**args, "cursor": cursor}
+                earlier = armed[1] | {active["message_id"]}
+                for item in await self.pending_replies(active["conversation_id"]):
+                    if item["message_id"] in earlier:
+                        continue
+                    # One reply answers one prompt. A later prompt arms anew
+                    # and wakes this loop, so scan again for replies to it.
+                    if self.armed is not armed or await self.answer_approval(item, armed):
+                        break
         except Exception as exc:  # noqa: BLE001 - the worker's next sweep still owns the item
             logger.warning(
                 "Ando approval reply check failed (%s); the next sweep handles it",
                 type(exc).__name__,
             )
 
-    async def answer_approval(self, item):
+    async def answer_approval(self, item, armed):
+        """Answer the armed prompt with this reply; True once it is consumed."""
         key = f"message:{item['message_id']}"
         if self.delivery.state.completed(key):
-            return
+            return False
         response = await self.transport.call(
             "get_message", {"message_id": item["message_id"]}
         )
@@ -84,24 +126,28 @@ class InboxRecovery:
         if message.get("id") != item["message_id"] or message.get(
             "conversation_id"
         ) != item["conversation_id"]:
-            return
+            return False
         ref = {
             "message_id": item["message_id"],
             "conversation_id": item["conversation_id"],
             "author_id": message.get("authorWorkspaceMembershipId"),
         }
-        answer = await self.approval(ref, message)
+        answer = await self.approval(ref, message) if self.armed is armed else None
         if answer is None:
-            return
+            return False
         revision = await self.acknowledge(item, "in_progress", item["revision"])
         if revision is None:
-            return
+            return False
+        # One reply answers one prompt. Disarm first: once answered, Hermes can
+        # post its next prompt, which arms again, before answer() returns.
+        self.armed = None
         await answer()
         self.delivery.state.complete(key)
         await self.acknowledge(item, "handled", revision)
         logger.info(
             "Ando message %s answered the running turn's approval", item["message_id"]
         )
+        return True
 
     async def on_event(self, frame):
         message_reference(
