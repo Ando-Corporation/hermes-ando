@@ -121,14 +121,14 @@ def configured_identity(config):
 
 
 async def connect(args, home, config, save_config):
-    import httpx
-
     preflight(config)
     path = home / "ando" / "connection.json"
     previous = read_connection(path) if path.exists() else None
     pending = path.with_name("connection-pending.json")
     importing = False
     if args.invite_stdin:
+        import httpx
+
         if configured_identity(config) and previous is None:
             raise SetupRequired(
                 "This profile has an existing OAuth receiver. Stop it and use that agent's reconnect response; never redeem a new-agent invitation"
@@ -215,6 +215,9 @@ async def connect(args, home, config, save_config):
             "group_sessions_per_user": False,
         },
     }
+    from .display import configure_reply_only
+
+    configure_reply_only(config)
     save_config(config)
     print(
         "Ando identity verified. Start or restart the existing Hermes gateway. Receiving is not yet verified."
@@ -256,7 +259,10 @@ async def receiving_test(args, config, connection, *, socket_connect=None):
 
     try:
         preflight(config)
-        report(True, "Plugin enabled and its dependencies installed")
+        from .display import check_reply_only
+
+        check_reply_only(config)
+        report(True, "Plugin enabled, dependencies installed and reply-only display configured")
     except SetupRequired as exc:
         report(False, str(exc))
     report(
@@ -447,6 +453,9 @@ async def execute(args):
             connection = read_connection(home / "ando" / "connection.json")
             if args.operation == "doctor":
                 preflight(config)
+                from .display import check_reply_only
+
+                check_reply_only(config)
                 transport = AndoTransport(
                     None, connection["agent_membership_id"], connection=connection
                 )

@@ -15,7 +15,7 @@ from plugin.protocol import (
     verify_workspace_info,
 )
 from plugin.state import DeliveryState
-from plugin.transport import receive_socket
+from plugin.transport import ToolError, receive_socket
 from server_fixtures import conversation_directory
 
 
@@ -71,6 +71,9 @@ class FakeTransport:
             return {"message_id": "reply-1"}
         if name in {"edit_message", "delete_message"}:
             return {"ok": True, "message_id": args["message_id"]}
+        if name == "report_problem":
+            # An Ando server from before report_problem refuses the call.
+            raise ToolError("Ando report_problem failed; review the connection in Ando")
         raise AssertionError(name)
 
 
@@ -126,15 +129,52 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.dispatch_count, 1)
         self.assertTrue(self.state.completed("event-1"))
 
-    async def test_thread_reply_uses_root_and_followups_keep_conversation_scope(self):
+    async def test_thread_reply_answers_its_own_message_not_the_root(self):
+        # Ando holds a reply when the thread moved on after the message it
+        # names. Naming the root would count the message being answered.
         delivery = self.delivery()
         await delivery.handle(event(thread="root"))
         await delivery.handle(event("event-2", "message-2", thread="root"))
         sends = [
             args for name, args in self.transport.calls if name == "reply_to_message"
         ]
-        self.assertEqual([args["message_id"] for args in sends], ["root", "root"])
+        self.assertEqual(
+            [args["message_id"] for args in sends], ["message-1", "message-2"]
+        )
         self.assertNotEqual(sends[0]["idempotency_key"], sends[1]["idempotency_key"])
+
+    async def test_a_reply_reaches_hermes_with_the_message_it_quotes(self):
+        seen = []
+
+        async def dispatch(ref, message, disabled):
+            seen.append(message["content"])
+            await delivery.send(delivery.chat_id(ref), "Hello back")
+
+        original = self.transport.call
+
+        async def call(name, args):
+            result = await original(name, args)
+            if name == "get_message":
+                result["data"]["content"] = "did you submit it?"
+                result["data"]["replied_to"] = {
+                    "message_id": "earlier",
+                    "author_id": "agent",
+                    "author_name": "Grok",
+                    "content": "Ando still has no Ramp vendor page",
+                    "content_truncated": False,
+                    "quote": "Ramp vendor page",
+                    "deleted": False,
+                }
+            return result
+
+        self.transport.call = call
+        delivery = self.delivery(dispatch)
+        await delivery.handle(event())
+        self.assertEqual(len(seen), 1)
+        self.assertIn("from Grok", seen[0])
+        self.assertIn("> Ando still has no Ramp vendor page", seen[0])
+        self.assertIn("> Ramp vendor page", seen[0])
+        self.assertTrue(seen[0].endswith("Reply:\ndid you submit it?"))
 
     async def test_turn_admission_without_reply_never_completes_event(self):
         async def no_reply(*_):
@@ -362,6 +402,58 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sends), 1)
         self.assertIn("Send it again", sends[0]["markdown_content"])
         self.assertIn("idempotency_key", sends[0])
+        self.assertTrue(self.state.completed("event-1"))
+
+    async def test_interrupted_generation_reports_a_problem_card_when_ando_offers_it(
+        self,
+    ):
+        await self.crash_then_restart()
+        reported = []
+        call = self.transport.call
+
+        async def with_report_problem(name, args):
+            if name == "report_problem":
+                self.transport.calls.append((name, copy.deepcopy(args)))
+                reported.append(args)
+                return {"state": "reported", "message_id": "problem-1"}
+            return await call(name, args)
+
+        self.transport.call = with_report_problem
+        await self.delivery().handle(event())
+        await self.delivery().handle(event())
+        self.assertEqual(self.dispatch_count, 1)
+        self.assertEqual(len(reported), 1)
+        self.assertEqual(reported[0]["kind"], "crashed")
+        self.assertEqual(reported[0]["conversation_id"], "conversation")
+        self.assertEqual(
+            [name for name, _ in self.transport.calls if name == "send_message"], []
+        )
+        self.assertTrue(self.state.completed("event-1"))
+
+    async def test_a_lost_problem_report_is_retried_not_doubled_with_text(self):
+        await self.crash_then_restart()
+        attempts = []
+        call = self.transport.call
+
+        async def answer_lost_once(name, args):
+            if name == "report_problem":
+                self.transport.calls.append((name, copy.deepcopy(args)))
+                attempts.append(args)
+                if len(attempts) == 1:
+                    raise OSError("uncertain network result")
+                # Ando already posted the card and returns the same one.
+                return {"state": "reported", "message_id": "problem-1"}
+            return await call(name, args)
+
+        self.transport.call = answer_lost_once
+        with self.assertRaises(OSError):
+            await self.delivery().handle(event())
+        self.assertFalse(self.state.completed("event-1"))
+        await self.delivery().handle(event())
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(
+            [name for name, _ in self.transport.calls if name == "send_message"], []
+        )
         self.assertTrue(self.state.completed("event-1"))
 
     async def test_reviewed_recovery_before_restart_retries_the_turn(self):

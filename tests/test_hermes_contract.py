@@ -89,9 +89,13 @@ class HermesContractTests(unittest.IsolatedAsyncioTestCase):
         self.adapter.config.extra.update(
             credential_mode="invitation", installer_id="human"
         )
-        with patch(
-            "gateway.status.acquire_scoped_lock",
-            return_value=(False, {"pid": 1}),
+        with (
+            patch("hermes_cli.config.load_config", return_value={"display": {
+                "platforms": {"ando": {
+                    "tool_progress": "off", "interim_assistant_messages": False,
+                }},
+            }}),
+            patch("gateway.status.acquire_scoped_lock", return_value=(False, {"pid": 1})),
         ):
             self.assertFalse(await self.adapter.connect())
         self.assertEqual(self.adapter.fatal_error_code, "lock_conflict")
@@ -194,6 +198,34 @@ class HermesContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             resolve_display_setting(opted_in, "ando", "long_running_notifications")
         )
+
+    async def test_setup_wins_over_global_and_legacy_progress_overrides(self):
+        from gateway.display_config import resolve_display_setting
+        from plugin.display import configure_reply_only, check_reply_only
+        from plugin.protocol import SetupRequired
+
+        config = {"display": {
+            "tool_progress": "all", "interim_assistant_messages": True,
+            "tool_progress_overrides": {"ando": "all"},
+        }}
+        with self.assertRaises(SetupRequired):
+            check_reply_only(config)
+        configure_reply_only(config)
+        check_reply_only(config)
+        self.assertEqual(resolve_display_setting(config, "ando", "tool_progress"), "off")
+        self.assertFalse(resolve_display_setting(config, "ando", "interim_assistant_messages"))
+        config["display"]["platforms"]["ando"]["tool_progress"] = "all"
+        with self.assertRaises(SetupRequired):
+            check_reply_only(config)
+
+    async def test_unsafe_profile_cannot_start_receiving(self):
+        self.adapter.config.extra["installer_id"] = "human"
+        with patch("hermes_cli.config.load_config", return_value={
+            "display": {"tool_progress": "all"}
+        }):
+            self.assertFalse(await self.adapter.connect())
+        self.assertIsNone(self.adapter._receiver)
+        self.assertIsNone(self.adapter._lock_key)
 
     async def test_interim_sends_and_statuses_never_become_the_reply(self):
         from gateway.run import _interim_metadata

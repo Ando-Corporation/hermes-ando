@@ -81,8 +81,9 @@ only to members you intend to grant that capability. Ando permissions still appl
 
 When a turn waits for command approval, the member who connected the agent can
 answer in the same Ando conversation with `/approve`, `/deny`, or a bare
-`approve`, `approve always`, `yes`, `deny` or `no`. Ando messages never run other
-Hermes gateway commands, and a reply from anyone else waits for the turn.
+`approve`, `approve always`, `yes`, `deny` or `no`, in the prompt's thread or
+at the top level of the channel. Ando messages never run other Hermes gateway
+commands, and a reply from anyone else waits for the turn.
 
 The backend must support the optional `execution_id` field on
 `acknowledge_agent_inbox_item`. The plugin refuses to generate until Ando confirms
@@ -114,9 +115,19 @@ profile requires restoring its protected backup; do not invent a new receiver
 identity to bypass an unfinished claim. Network delivery is at least once; this
 is not a promise of exactly-once execution of arbitrary model tools.
 
-Ando gets the final reply only: the plugin registers Hermes's `low` display
-tier, which turns off tool progress, interim commentary and the "⏳ Working"
-heartbeat. Ando's 👀 on the message shows the turn started. To keep a heartbeat
+`hermes ando connect` explicitly sets `display.platforms.ando.tool_progress:
+"off"` and `display.platforms.ando.interim_assistant_messages: false`, preserving
+other display preferences. Global settings override the plugin's `low` display
+tier, so the tier alone is insufficient. Existing installations should stop the
+gateway, rerun `hermes ando connect` using their saved invitation credentials,
+and restart. Legacy OAuth profiles should instead set those two values directly
+in their profile's config.yaml and restart; they have no saved invitation
+credential for `hermes ando connect`.
+Startup, `doctor` and `test` reject unsafe effective settings before receiving.
+This prevents unmarked tool progress from entering the durable outbox and
+prematurely verifying receiving as though it were a final reply. The `low` tier
+also disables the "⏳ Working" heartbeat by default. Ando's 👀 on the message
+shows the turn started. To keep a heartbeat
 for long turns, set `display.platforms.ando.long_running_notifications: true`
 in the profile's config.yaml; it is posted once and then edited in place, and,
 like any status Hermes marks as interim, it is never stored or resent as the
@@ -185,8 +196,8 @@ current candidate test targets are Hermes main
 Python 3.14, MCP 2.0.0, httpx2 2.12.0, and websockets 15.0.1. plugin.yaml
 declares bounded ranges rather than pins, so a Hermes that moved to a newer
 httpx2 can still install it. Hermes before v0.21.6 has no display tiers: the
-plugin still loads there but cannot keep tool progress out of Ando, and logs a
-warning to update Hermes.
+plugin still loads there but receiving requires an update to Hermes with display
+configuration support.
 This is source compatibility evidence, not a claim that all Hermes versions or
 operating systems are supported.
 The current private-file lock implementation targets macOS/Linux.

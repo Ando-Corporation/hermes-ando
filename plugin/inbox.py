@@ -10,6 +10,7 @@ import json
 import logging
 
 from .protocol import SetupRequired, message_reference
+from .transport import ToolError
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,68 @@ logger = logging.getLogger(__name__)
 # source message (one inbox item per message); `get_messages_by_time_range`
 # names the history window of an older grouped item.
 SUPPORTED_RECOVERY_TOOLS = {"get_message", "get_messages_by_time_range"}
+
+# Items that can answer a running turn's approval prompt. Ando lists a
+# top-level channel message that mentions no one as a "notice", so a member
+# who types /approve in the channel instead of the prompt's thread still
+# answers it. Notices never start a turn of their own (see sweep).
+APPROVAL_REPLY_TYPES = {"mention", "direct_message", "reply", "notice"}
+
+
+# A Jam the agent read while its summary was processing now has one (or
+# processing failed). Ando lists it at the message the agent was answering.
+CALL_SUMMARY_READY = "call_summary_ready"
+
+
+def call_summary_preface(item):
+    call_id = item.get("call_id") or (item.get("recovery") or {}).get(
+        "arguments", {}
+    ).get("call_id")
+    recovery = item.get("recovery") or {}
+    args = recovery.get("arguments") or {"call_id": call_id}
+    access_hint = f" Read get_call with {json.dumps(args)}; keep any forwarded_message_id when reading its transcript."
+    if item.get("summary_status") == "failed":
+        return (
+            f"Ando: processing the Jam you read earlier (call_id {call_id}) failed, "
+            "so its summary will not arrive. If its transcript has text, finish the "
+            "request below from that; otherwise tell the asker in one line that the "
+            "summary could not be produced." + access_hint
+        )
+    return (
+        f"Ando: the Jam you read earlier (call_id {call_id}) has finished processing, "
+        "and its summary is ready now. Read the Jam again and finish the request "
+        "below, without saying you were waiting or woken." + access_hint
+    )
+
+
+# A check-back the agent booked (check_back) has come due. Ando lists it at the
+# message the agent booked it from, with the reason the agent gave itself.
+CHECK_BACK_DUE = "check_back_due"
+
+
+def check_back_preface(item):
+    reason = item.get("reason") or "follow up on this thread"
+    return (
+        f"Ando: the check-back you booked earlier is due now. Your reason: {reason} "
+        "Look again and post only if there is something new or useful to say; "
+        "do not mention being woken or the check-back itself."
+    )
+
+
+# A member pressed a button on a card the agent posted, on an action that asks
+# to wake the agent (wakeAgent). Ando lists it at the card's message, with who
+# pressed what and the press's input.
+CARD_PRESS = "card_press"
+
+
+def card_press_preface(item):
+    reason = item.get("reason") or (
+        f"A member pressed {json.dumps(item.get('action_id'))} on your card."
+    )
+    return (
+        f"Ando: {reason} The card below is the one that was pressed; "
+        "do not mention being woken."
+    )
 
 
 class InboxRecovery:
@@ -56,7 +119,7 @@ class InboxRecovery:
             items += [
                 item
                 for item in result["items"]
-                if item.get("type") in {"mention", "direct_message", "reply"}
+                if item.get("type") in APPROVAL_REPLY_TYPES
                 and item.get("message_id")
                 and item.get("revision")
                 and item.get("conversation_id") == conversation_id
@@ -181,6 +244,15 @@ class InboxRecovery:
                     } and item.get("message_id"):
                         found += 1
                         await self.handle(item)
+                    elif item.get("type") == CALL_SUMMARY_READY:
+                        found += 1
+                        await self.handle_call_summary(item)
+                    elif item.get("type") == CHECK_BACK_DUE:
+                        found += 1
+                        await self.handle_check_back(item)
+                    elif item.get("type") == CARD_PRESS:
+                        found += 1
+                        await self.handle_card_press(item)
                 page = result["page"]
                 if not page["has_more"]:
                     break
@@ -303,6 +375,109 @@ class InboxRecovery:
         ):
             raise SetupRequired("Ando could not recover the original thread root")
         return [root]
+
+    async def handle_call_summary(self, item):
+        """Answer the asking message again once its Jam summary is ready."""
+        await self.handle_rewake(item, "call-summary", call_summary_preface(item))
+
+    async def handle_check_back(self, item):
+        """Come back to the booked-from message when its check-back is due."""
+        await self.handle_rewake(
+            item, "check-back", check_back_preface(item), check_back=True
+        )
+
+    async def handle_card_press(self, item):
+        """Act on a press of one of the agent's own cards. The card is the
+        agent's message, so it runs like a check-back (its own message, may
+        end quietly), but the local allowlist applies to whoever pressed."""
+        allowed = self.delivery.allowed_users
+        presser = item.get("pressed_by_member_id")
+        if allowed is not None and "*" not in allowed and presser not in allowed:
+            if not item.get("revision"):
+                raise SetupRequired(
+                    "Ando must return revisioned inbox items before automatic receiving can start"
+                )
+            logger.warning(
+                "Ando card press %s is from member %s, who is not in allowed_users; no turn. "
+                "Set ANDO_ALLOWED_USERS or ANDO_ALLOW_ALL_USERS to admit them",
+                item["event_id"],
+                presser,
+            )
+            revision = await self.acknowledge(item, "in_progress", item["revision"])
+            if revision is not None:
+                await self.acknowledge(item, "read", revision)
+            return
+        await self.handle_rewake(
+            item, "card-press", card_press_preface(item), check_back=True
+        )
+
+    async def handle_rewake(self, item, kind, preface, check_back=False):
+        """Run one more turn on an earlier message, named by a virtual inbox item."""
+        if not item.get("revision"):
+            raise SetupRequired(
+                "Ando must return revisioned inbox items before automatic receiving can start"
+            )
+        revision = await self.acknowledge(item, "in_progress", item["revision"])
+        if revision is None:
+            return
+        message_id = item.get("message_id")
+        if not message_id or item.get("recovery") is None:
+            # No message to answer (a Jam read outside a request, or access
+            # to the thread was removed).
+            logger.info(
+                "Ando %s item %s has no message to answer; marking it read",
+                kind,
+                item["event_id"],
+            )
+            await self.acknowledge(item, "read", revision)
+            return
+        try:
+            response = await self.transport.call("get_message", {"message_id": message_id})
+        except ToolError:
+            # The transport cannot distinguish a refusal from a temporary
+            # backend error. Leave the item claimed for this receiver to retry;
+            # the next listing retires it only if canonical access was revoked.
+            logger.warning("Ando %s source unavailable; leaving item for retry", kind)
+            return
+        message = response.get("data", response)
+        if (
+            message.get("id") != message_id
+            or message.get("conversation_id") != item["conversation_id"]
+        ):
+            raise SetupRequired("Ando returned a different source message")
+        item = {
+            **item,
+            "thread_root_message_id": message.get("thread_root_id")
+            or item.get("thread_root_message_id"),
+        }
+        frame = {
+            "payload": {
+                "id": f"{kind}:{item['event_id']}",
+                "type": "message.created",
+                "workspace_id": self.delivery.workspace_id,
+                "data": {
+                    "object": {
+                        "id": message_id,
+                        "conversation_id": item["conversation_id"],
+                        "authorWorkspaceMembershipId": message.get(
+                            "authorWorkspaceMembershipId"
+                        ),
+                    }
+                },
+                "related": {
+                    "thread_root_message_id": item.get("thread_root_message_id")
+                },
+            }
+        }
+        await self.delivery.handle(
+            frame,
+            history=await self.thread_root(item) or None,
+            event_key=f"{kind}:{item['event_id']}",
+            preface=preface,
+            **({"check_back": True} if check_back else {}),
+        )
+        await self.acknowledge(item, "handled", revision)
+        logger.info("Ando %s item %s handled", kind, item["event_id"])
 
     async def handle(self, item):
         if not item.get("revision"):

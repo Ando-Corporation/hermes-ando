@@ -93,7 +93,7 @@ class DeliveryFilesTests(unittest.IsolatedAsyncioTestCase):
             await delivery.send_files(delivery.chat_id(ref), [(self.png, None)])
         delivery = self.delivery(dispatch)
         await delivery.handle(event(thread="root"))
-        self.assertEqual(self.replies()[0][1:3], ("reply_to_message", {"message_id": "root", "file_ids": ["file-1"]}))
+        self.assertEqual(self.replies()[0][1:3], ("reply_to_message", {"message_id": "message-1", "file_ids": ["file-1"]}))
 
     async def test_failed_upload_lets_hermes_notice_take_the_slot(self):
         async def dispatch(ref, message, disabled):

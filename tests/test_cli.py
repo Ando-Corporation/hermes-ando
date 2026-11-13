@@ -49,6 +49,35 @@ class Transport:
         }
 
 
+class ReplyOnlySetupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connect_overrides_global_progress_without_changing_other_platforms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = {"display": {
+                "tool_progress": "all", "interim_assistant_messages": True,
+                "platforms": {"telegram": {"tool_progress": "new"},
+                              "ando": {"long_running_notifications": True}},
+            }}
+            saved = []
+            with (
+                patch("plugin.cli.preflight"),
+                patch("plugin.cli.AndoTransport", Transport),
+                patch("sys.stdin", io.StringIO(json.dumps(VALUE))),
+                redirect_stdout(io.StringIO()),
+            ):
+                await connect(
+                    SimpleNamespace(invite_stdin=False, credential_stdin=True, name=None),
+                    Path(directory), config, lambda value: saved.append(copy.deepcopy(value)),
+                )
+            display = saved[0]["display"]
+            self.assertEqual(display["tool_progress"], "all")
+            self.assertTrue(display["interim_assistant_messages"])
+            self.assertEqual(display["platforms"]["telegram"], {"tool_progress": "new"})
+            self.assertEqual(display["platforms"]["ando"], {
+                "tool_progress": "off", "interim_assistant_messages": False,
+                "long_running_notifications": True,
+            })
+
+
 @unittest.skipUnless(
     os.environ.get("HERMES_SOURCE"),
     "Set HERMES_SOURCE for installed CLI dependency checks",
@@ -265,6 +294,9 @@ def message_event(author):
 )
 class ReceivingTestCommand(unittest.IsolatedAsyncioTestCase):
     CONFIG = {
+        "display": {"platforms": {"ando": {
+            "tool_progress": "off", "interim_assistant_messages": False,
+        }}},
         "gateway": {
             "platforms": {
                 "ando": {"enabled": True, "extra": {"credential_mode": "invitation"}}

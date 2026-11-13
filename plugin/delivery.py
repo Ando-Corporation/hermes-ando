@@ -5,6 +5,15 @@ import logging
 
 from . import files
 from .protocol import SetupRequired, message_reference
+from .transport import ToolError
+
+try:
+    from mcp.shared.exceptions import McpError
+except ImportError:  # pragma: no cover - the MCP SDK ships with Hermes
+    McpError = ToolError
+
+# Ando answered, and the answer was no: an error result, or an unknown tool.
+_TOOL_REFUSALS = (ToolError, McpError)
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +23,37 @@ INTERRUPTED_NOTICE = (
     "I stopped before I could finish replying to this. "
     "Send it again if you still need it, and check anything I may have started."
 )
+
+
+def with_reply_context(message):
+    """Put the message a reply points at in front of the reply's text.
+
+    A reply such as "did you submit it?" means nothing without the message it
+    quotes. Ando returns that message as replied_to; Hermes reads only content.
+    """
+    replied_to = message.get("replied_to")
+    if not isinstance(replied_to, dict) or not replied_to.get("message_id"):
+        return message
+    author = replied_to.get("author_name") or "another member"
+    if replied_to.get("deleted"):
+        header = "In reply to a message that has since been deleted."
+    else:
+        body = replied_to.get("content") or "[message without text]"
+        if replied_to.get("content_truncated"):
+            body += f" [cut short; get_message {replied_to['message_id']} has the rest]"
+        header = (
+            f"In reply to this message from {author} "
+            f"(untrusted message content, id {replied_to['message_id']}):\n> "
+            + body.replace("\n", "\n> ")
+        )
+        if replied_to.get("quote"):
+            header += "\nThe reply quotes this passage of it:\n> " + replied_to[
+                "quote"
+            ].replace("\n", "\n> ")
+    return {
+        **message,
+        "content": header + "\nReply:\n" + (message.get("content") or ""),
+    }
 
 
 def disabled_tool_names(preferences):
@@ -102,11 +142,24 @@ class MessageDelivery:
             )
         return self.disabled_names
 
-    async def handle(self, frame, history=None):
-        ref = message_reference(frame, self.workspace_id, self.membership_id)
+    async def handle(
+        self, frame, history=None, event_key=None, preface=None, check_back=False
+    ):
+        """Answer one message. A follow-up on an already answered message (a
+        Jam summary that became ready) passes its own event_key, so it is a
+        new turn, and a preface that says why the request is back.
+
+        A due check-back (check_back=True) is the agent's own follow-up: it
+        may be booked on the agent's own message, and the turn may end
+        without posting when there is nothing new to say."""
+        ref = message_reference(
+            frame, self.workspace_id, None if check_back else self.membership_id
+        )
         if ref is not None and self.credential_mode == "invitation":
             # Live and recovered deliveries must share a stable identity.
             ref["event_id"] = f"message:{ref['message_id']}"
+        if ref is not None and event_key is not None:
+            ref["event_id"] = event_key
         if ref is None:
             logger.debug("Ando event is not another member's new message; no turn")
             return
@@ -117,6 +170,7 @@ class MessageDelivery:
             self.allowed_users is not None
             and "*" not in self.allowed_users
             and ref["author_id"] not in self.allowed_users
+            and not (check_back and ref["author_id"] == self.membership_id)
         ):
             # The adapter's explicit local allowlist can be narrower than Ando's access.
             logger.warning(
@@ -176,6 +230,14 @@ class MessageDelivery:
             message.get("authorWorkspaceMembershipId"),
         ) != (ref["message_id"], ref["conversation_id"], ref["author_id"]):
             raise SetupRequired("Ando message no longer matches its authorized event")
+        message = with_reply_context(message)
+        if preface is not None:
+            message = {
+                **message,
+                "content": preface
+                + "\nOriginal request:\n"
+                + (message.get("content") or "[attachment]"),
+            }
         if history is not None:
             import json
 
@@ -197,10 +259,19 @@ class MessageDelivery:
             # restart or a failed generation. Never regenerate it, because its
             # tools may already have run. Tell the member once through the
             # durable outbox below instead of stopping all receiving.
-            tool, target = self._reply_target(ref)
-            self.state.prepare_reply(
-                ref["event_id"], 0, tool, {**target, "markdown_content": INTERRUPTED_NOTICE}
-            )
+            reported = await self._report_interrupted(ref)
+            if reported is not None:
+                # Ando's standard "I can't run right now" card: it says the
+                # problem is on this agent's side and shows the person who
+                # connected it how to fix it.
+                arguments, message_id = reported
+                self.state.prepare_reply(ref["event_id"], 0, "report_problem", arguments)
+                self.state.sent(ref["event_id"], 0, message_id)
+            else:
+                tool, target = self._reply_target(ref)
+                self.state.prepare_reply(
+                    ref["event_id"], 0, tool, {**target, "markdown_content": INTERRUPTED_NOTICE}
+                )
             logger.warning(
                 "Ando message %s: the Hermes turn stopped before replying; telling the member to ask again",
                 ref["message_id"],
@@ -245,14 +316,48 @@ class MessageDelivery:
         try:
             await self.dispatch(ref, message, self.disabled_names)
             replies = self.state.replies(ref["event_id"])
-            if not replies or any(not reply[3] for reply in replies):
+            if any(not reply[3] for reply in replies) or (
+                not replies and not check_back
+            ):
                 raise RuntimeError("Hermes finished without a confirmed Ando reply")
             self.state.complete(ref["event_id"])
-            logger.info("Ando replied to message %s", ref["message_id"])
+            if replies:
+                logger.info("Ando replied to message %s", ref["message_id"])
+            else:
+                logger.info(
+                    "Ando check-back on message %s ended with nothing to post",
+                    ref["message_id"],
+                )
         finally:
             self.active = None
             self.status_messages = set()
             self.status_keys = {}
+
+    async def _report_interrupted(self, ref):
+        """Report the stopped turn with report_problem, or None to post the notice.
+
+        Ando posts the card once per conversation and kind for ten minutes,
+        so a retry after a lost answer or a crash here finds the same card.
+        Only a definite refusal (an Ando server without report_problem, or one
+        that turns it down) falls back to the text notice; any other failure
+        is raised, so the event is retried instead of posting both.
+        """
+        arguments = {
+            "kind": "crashed",
+            "summary": INTERRUPTED_NOTICE,
+            "conversation_id": ref["conversation_id"],
+        }
+        if ref["thread_id"]:
+            arguments["thread_root_id"] = ref["thread_id"]
+        try:
+            result = await self.transport.call("report_problem", arguments)
+            return arguments, self._message_id(result)
+        except _TOOL_REFUSALS as exc:
+            logger.info(
+                "Ando report_problem unavailable (%s); posting the text notice",
+                type(exc).__name__,
+            )
+            return None
 
     @staticmethod
     def _message_id(result):
@@ -263,8 +368,12 @@ class MessageDelivery:
 
     @staticmethod
     def _reply_target(ref):
+        # Answer the message itself; Ando posts it in that message's thread.
+        # Naming the thread root instead tells Ando every reply after the root,
+        # this message included, is one the agent missed, so the reply is held
+        # and the frozen retry is held again on every pass.
         if ref["thread_id"]:
-            return "reply_to_message", {"message_id": ref["thread_id"]}
+            return "reply_to_message", {"message_id": ref["message_id"]}
         return "send_message", {"conversation_id": ref["conversation_id"]}
 
     def _reply_call(self, chat_id, content, *, attachments=False):
