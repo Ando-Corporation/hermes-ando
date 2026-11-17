@@ -94,6 +94,37 @@ class ApiTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("oauth" in url for url in seen))
 
 
+class ToolErrorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_tool_error_keeps_ando_error_code_and_reason_not_its_text(self):
+        from types import SimpleNamespace
+
+        from plugin.transport import AndoTransport, ToolError
+
+        envelope = {
+            "error": "Nothing was posted. Private thread context.",
+            "code": "conflict",
+            "reason": "newer_thread_messages",
+        }
+        result = SimpleNamespace(
+            isError=True,
+            content=[SimpleNamespace(type="text", text=json.dumps(envelope))],
+        )
+
+        class Session:
+            async def call_tool(self, name, arguments):
+                return result
+
+        transport = AndoTransport.__new__(AndoTransport)
+        transport.session = Session()
+        with self.assertRaises(ToolError) as caught:
+            await transport.call("reply_to_message", {})
+        self.assertEqual(
+            (caught.exception.code, caught.exception.reason),
+            ("conflict", "newer_thread_messages"),
+        )
+        self.assertNotIn("Private", str(caught.exception))
+
+
 class ReplayRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_expired_replay_subscribes_before_inbox_recovery(self):
         from plugin.transport import ReplayExpired, listen

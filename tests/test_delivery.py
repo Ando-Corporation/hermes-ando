@@ -143,6 +143,137 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotEqual(sends[0]["idempotency_key"], sends[1]["idempotency_key"])
 
+    async def test_later_thread_posts_name_this_turns_own_posts_as_seen(self):
+        # Ando holds a thread reply when anything was posted after the message
+        # it answers, so part two would wait forever on part one, and the
+        # answer on the turn's own status line.
+        async def status_then_two_parts(ref, message, disabled):
+            chat = delivery.chat_id(ref)
+            await delivery.send_status(chat, "⏳ Working — 3 min")
+            await delivery.send(chat, "Part one")
+            await delivery.send(chat, "Part two")
+
+        delivery = self.delivery(status_then_two_parts)
+        await delivery.handle(event(thread="root"))
+        sends = [
+            args for name, args in self.transport.calls if name == "reply_to_message"
+        ]
+        self.assertEqual(
+            [args.get("seen_through_message_id") for args in sends],
+            [None, "status-1", "reply-1"],
+        )
+        await delivery.handle(event("event-2", "message-2", thread="root"))
+        next_turn = [
+            args for name, args in self.transport.calls if name == "reply_to_message"
+        ][3]
+        self.assertNotIn("seen_through_message_id", next_turn)
+
+    async def test_part_two_after_a_restart_still_names_the_sent_part_one(self):
+        async def two_parts(ref, message, disabled):
+            chat = delivery.chat_id(ref)
+            await delivery.send(chat, "Part one")
+            await delivery.send(chat, "Part two")
+
+        delivery = self.delivery(two_parts)
+        original = self.transport.call
+
+        async def fail_part_two(name, args):
+            if args.get("markdown_content") == "Part two":
+                self.transport.calls.append((name, copy.deepcopy(args)))
+                raise OSError("uncertain network result")
+            return await original(name, args)
+
+        self.transport.call = fail_part_two
+        with self.assertRaises(OSError):
+            await delivery.handle(event(thread="root"))
+        self.state.close()
+        self.state = DeliveryState(self.path, "workspace", "agent")
+        self.transport.call = original
+        delivery = self.delivery(two_parts)
+        await delivery.handle(event(thread="root"))
+        part_two = [
+            args
+            for name, args in self.transport.calls
+            if name == "reply_to_message" and args["markdown_content"] == "Part two"
+        ]
+        self.assertEqual(len(part_two), 2)
+        self.assertEqual(part_two[0], part_two[1])
+        self.assertEqual(part_two[1]["seen_through_message_id"], "reply-1")
+        self.assertEqual(
+            len(
+                [
+                    args
+                    for name, args in self.transport.calls
+                    if name == "reply_to_message"
+                    and args["markdown_content"] == "Part one"
+                ]
+            ),
+            1,
+        )
+        self.assertTrue(self.state.completed("event-1"))
+
+    async def test_a_refused_prepared_reply_is_retired_not_replayed_forever(self):
+        # A reply Ando holds because the thread moved on is refused the same
+        # way on every replay. Raising would stop the inbox at this item on
+        # every reconnect, so the replay retires it and later work proceeds.
+        original = self.transport.call
+
+        async def thread_moved_on(name, args):
+            if name == "reply_to_message" and args["message_id"] == "message-1":
+                self.transport.calls.append((name, copy.deepcopy(args)))
+                raise ToolError(
+                    "Ando reply_to_message failed; review the connection in Ando",
+                    "conflict",
+                    "newer_thread_messages",
+                )
+            return await original(name, args)
+
+        self.transport.call = thread_moved_on
+        with self.assertRaises(ToolError):
+            await self.delivery().handle(event(thread="root"))
+        self.state.close()
+        self.state = DeliveryState(self.path, "workspace", "agent")
+        await self.delivery().handle(event(thread="root"))
+        self.assertTrue(self.state.completed("event-1"))
+        await self.delivery().handle(event(thread="root"))
+        await self.delivery().handle(event("event-2", "message-2", thread="root"))
+        sends = [
+            args["message_id"]
+            for name, args in self.transport.calls
+            if name == "reply_to_message"
+        ]
+        self.assertEqual(sends, ["message-1", "message-1", "message-2"])
+        self.assertEqual(self.dispatch_count, 2)
+
+    async def test_a_temporary_backend_error_keeps_the_prepared_reply(self):
+        # Only a refusal the frozen reply meets on every replay retires it. An
+        # internal error can clear, so the reply waits and posts once it does.
+        original = self.transport.call
+        failing = True
+
+        async def backend_down(name, args):
+            if failing and name == "reply_to_message":
+                self.transport.calls.append((name, copy.deepcopy(args)))
+                raise ToolError(
+                    "Ando reply_to_message failed; review the connection in Ando",
+                    "internal_error",
+                )
+            return await original(name, args)
+
+        self.transport.call = backend_down
+        with self.assertRaises(ToolError):
+            await self.delivery().handle(event(thread="root"))
+        self.state.close()
+        self.state = DeliveryState(self.path, "workspace", "agent")
+        with self.assertRaises(ToolError):
+            await self.delivery().handle(event(thread="root"))
+        self.assertFalse(self.state.completed("event-1"))
+        failing = False
+        await self.delivery().handle(event(thread="root"))
+        self.assertTrue(self.state.completed("event-1"))
+        self.assertEqual(self.state.replies("event-1")[0][3], "reply-1")
+        self.assertEqual(self.dispatch_count, 1)
+
     async def test_a_reply_reaches_hermes_with_the_message_it_quotes(self):
         seen = []
 

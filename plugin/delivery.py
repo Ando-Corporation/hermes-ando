@@ -15,6 +15,16 @@ except ImportError:  # pragma: no cover - the MCP SDK ships with Hermes
 # Ando answered, and the answer was no: an error result, or an unknown tool.
 _TOOL_REFUSALS = (ToolError, McpError)
 
+# Refusals a frozen reply meets again on every replay. A held reply stays held
+# because the thread only grows; a missing target or invalid arguments do not
+# change. Internal and access errors can clear, so those replies wait.
+_TERMINAL_REASONS = {"newer_thread_messages"}
+_TERMINAL_CODES = {"not_found", "validation_error"}
+
+
+def _never_posts_unchanged(error):
+    return error.reason in _TERMINAL_REASONS or error.code in _TERMINAL_CODES
+
 logger = logging.getLogger(__name__)
 
 # Posted once when a turn stopped before it prepared a reply. Its tools may
@@ -120,6 +130,8 @@ class MessageDelivery:
         # This turn's status messages: posted but never part of its reply.
         self.status_messages = set()
         self.status_keys = {}
+        # The newest message this turn posted, status or reply part.
+        self.last_posted = None
 
     async def preferences(self):
         preferences = await self.transport.call(
@@ -290,6 +302,7 @@ class MessageDelivery:
                 self.state.prepare_reply(
                     ref["event_id"], ordinal, tool, {**target, **arguments}
                 )
+            self.last_posted = None
             for ordinal, tool, arguments, message_id in self.state.replies(
                 ref["event_id"]
             ):
@@ -298,15 +311,35 @@ class MessageDelivery:
                         "Ando replies are disabled in Settings > Members"
                     )
                 if message_id is None:
-                    result = await self.transport.call(tool, arguments)
+                    try:
+                        result = await self.transport.call(
+                            tool, self._past_own_posts(tool, arguments)
+                        )
+                    except ToolError as exc:
+                        if not _never_posts_unchanged(exc):
+                            raise
+                        # The frozen reply can never post unchanged, and raising
+                        # would replay it on every reconnect with the whole
+                        # inbox stuck behind it. Retire it and the parts after
+                        # it; when the thread moved on, the newer messages come
+                        # back as their own work.
+                        logger.warning(
+                            "Ando refused the prepared reply for message %s (%s); retiring it so the inbox can move on",
+                            ref["message_id"],
+                            exc.reason or exc.code,
+                        )
+                        break
                     message_id = self._message_id(result)
                     self.state.sent(ref["event_id"], ordinal, message_id)
+                self.last_posted = message_id
+            self.last_posted = None
             self.state.complete(ref["event_id"])
             return
         self.active = ref
         self.ordinal = 0
         self.status_messages = set()
         self.status_keys = {}
+        self.last_posted = None
         self.state.begin(ref["event_id"])
         logger.info(
             "Ando starting a Hermes turn for message %s in %s",
@@ -332,6 +365,7 @@ class MessageDelivery:
             self.active = None
             self.status_messages = set()
             self.status_keys = {}
+            self.last_posted = None
 
     async def _report_interrupted(self, ref):
         """Report the stopped turn with report_problem, or None to post the notice.
@@ -391,6 +425,15 @@ class MessageDelivery:
             args["markdown_content"] = content
         return ref, tool, args
 
+    def _past_own_posts(self, tool, args):
+        # Ando holds a thread reply when anything was posted after the message
+        # it answers, this turn's own status line or first part included, so
+        # name the newest of them as seen. It stays out of the frozen
+        # arguments: after a restart this turn may know a later post.
+        if tool != "reply_to_message" or self.last_posted is None:
+            return args
+        return {**args, "seen_through_message_id": self.last_posted}
+
     async def send(self, chat_id, content):
         ref, tool, args = self._reply_call(chat_id, content)
         return await self._send_frozen(ref, tool, args)
@@ -421,10 +464,11 @@ class MessageDelivery:
             ref["event_id"], self.ordinal, tool, args
         )
         if message_id is None:
-            result = await self.transport.call(tool, args)
+            result = await self.transport.call(tool, self._past_own_posts(tool, args))
             message_id = self._message_id(result)
             self.state.sent(ref["event_id"], self.ordinal, message_id)
         self.ordinal += 1
+        self.last_posted = message_id
         return message_id
 
     async def send_status(self, chat_id, content, key=None):
@@ -441,8 +485,11 @@ class MessageDelivery:
                 return message_id
             self.status_keys.pop(key, None)
         _, tool, args = self._reply_call(chat_id, content)
-        message_id = self._message_id(await self.transport.call(tool, args))
+        message_id = self._message_id(
+            await self.transport.call(tool, self._past_own_posts(tool, args))
+        )
         self.status_messages.add(message_id)
+        self.last_posted = message_id
         if key is not None:
             self.status_keys[key] = message_id
         return message_id

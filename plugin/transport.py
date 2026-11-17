@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # What every connection names itself on MCP initialize; Ando compares it with
 # the published release to tell the installer when to update (plugin.yaml).
-CLIENT_INFO = {"name": "Ando Hermes", "version": "0.2.9"}
+CLIENT_INFO = {"name": "Ando Hermes", "version": "0.2.10"}
 
 # Realtime wakes the agent for its DMs and mentions, and every new socket
 # (at least every 15 minutes) sweeps the inbox, so this reconcile only catches
@@ -33,7 +33,41 @@ def websocket_connect(*args, **kwargs):
 
 
 class ToolError(RuntimeError):
-    """Ando answered the tool call with an error: a definite refusal, not a lost connection."""
+    """Ando answered the tool call with an error: a definite refusal, not a lost connection.
+
+    code and reason are Ando's stable error identifiers, kept so a caller can
+    tell a refusal that will never succeed from a temporary backend failure.
+    The error text is never kept: it can hold private context.
+    """
+
+    def __init__(self, message, code=None, reason=None):
+        super().__init__(message)
+        self.code = code
+        self.reason = reason
+
+
+def _error_identifiers(result):
+    envelope = getattr(
+        result, "structured_content", getattr(result, "structuredContent", None)
+    )
+    if not isinstance(envelope, dict):
+        envelope = None
+        for block in getattr(result, "content", None) or []:
+            if getattr(block, "type", None) == "text":
+                try:
+                    value = json.loads(block.text)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(value, dict):
+                    envelope = value
+                    break
+    if envelope is None:
+        return None, None
+    code, reason = envelope.get("code"), envelope.get("reason")
+    return (
+        code if isinstance(code, str) else None,
+        reason if isinstance(reason, str) else None,
+    )
 
 
 class ReplayExpired(SetupRequired):
@@ -150,7 +184,10 @@ class AndoTransport:
         result = await self.session.call_tool(name, arguments)
         if getattr(result, "is_error", getattr(result, "isError", False)):
             # Tool error text can contain private context or URLs. Keep logs generic.
-            raise ToolError(f"Ando {name} failed; review the connection in Ando")
+            code, reason = _error_identifiers(result)
+            raise ToolError(
+                f"Ando {name} failed; review the connection in Ando", code, reason
+            )
         structured = getattr(
             result, "structured_content", getattr(result, "structuredContent", None)
         )
