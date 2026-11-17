@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # What every connection names itself on MCP initialize; Ando compares it with
 # the published release to tell the installer when to update (plugin.yaml).
-CLIENT_INFO = {"name": "Ando Hermes", "version": "0.2.10"}
+CLIENT_INFO = {"name": "Ando Hermes", "version": "0.2.11"}
 
 # Realtime wakes the agent for its DMs and mentions, and every new socket
 # (at least every 15 minutes) sweeps the inbox, so this reconcile only catches
@@ -72,6 +72,29 @@ def _error_identifiers(result):
 
 class ReplayExpired(SetupRequired):
     """The server explicitly rejected only the realtime replay checkpoint."""
+
+
+class ReplayPolicyChanged(SetupRequired):
+    """The agent's wake policy changed after this cursor was issued.
+
+    The cursor can never be accepted again, but the credential is still valid,
+    so the receiver drops the cursor and opens a connection from now.
+    """
+
+
+def _error_code(response):
+    try:
+        detail = response.json()
+    except ValueError:
+        return None
+    if not isinstance(detail, dict):
+        return None
+    if isinstance(detail.get("error_code"), str):
+        return detail["error_code"]
+    error = detail.get("error")
+    if isinstance(error, dict) and isinstance(error.get("code"), str):
+        return error["code"]
+    return None
 
 
 def configured_server(name):
@@ -230,6 +253,8 @@ class AndoTransport:
             else None,
         )
         if cursor and response.status_code == 400:
+            if _error_code(response) == "wake_policy_changed":
+                raise ReplayPolicyChanged("Ando agent wake policy changed")
             try:
                 detail = response.json()
             except ValueError:
@@ -336,6 +361,17 @@ async def listen(transport, state, on_event, on_connected, wake=None):
     """One realtime connection. Inbox receivers pass wake, called once subscribed."""
     try:
         ticket = await transport.ticket(state.get("cursor"))
+    except ReplayPolicyChanged:
+        # Retrying this cursor keeps the agent offline. Like the Ando SDK, drop
+        # it and open once from now; an inbox receiver's wake() sweep below
+        # recovers pending work from before the new connection.
+        if wake is None:
+            logger.warning(
+                "Ando agent wake policy changed; realtime resumes from now, "
+                "and events since the last acknowledged one are not replayed"
+            )
+        state.set("cursor", None)
+        ticket = await transport.ticket(None)
     except ReplayExpired:
         if wake is None or transport.connection is None:
             # Legacy realtime-only receivers have no authoritative inbox sweep.

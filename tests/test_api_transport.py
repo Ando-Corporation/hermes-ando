@@ -194,6 +194,88 @@ class ReplayRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 await transport.ticket("old")
             self.assertNotIsInstance(result.exception, ReplayExpired)
 
+    async def test_wake_policy_change_rejection_is_classified_only_for_a_resume(self):
+        from plugin.transport import AndoTransport, ReplayExpired, ReplayPolicyChanged
+        from plugin.protocol import SetupRequired
+        from unittest.mock import AsyncMock, MagicMock
+        transport = AndoTransport(None, VALUE["agent_membership_id"], connection=VALUE)
+        for body in [
+            {"error": {"code": "wake_policy_changed", "message": "Reconnect without resume_from."}},
+            {"error_code": "wake_policy_changed"},
+        ]:
+            response = MagicMock(status_code=400)
+            response.json.return_value = body
+            transport.http = MagicMock(post=AsyncMock(return_value=response))
+            with self.assertRaises(ReplayPolicyChanged) as result:
+                await transport.ticket("old")
+            self.assertNotIsInstance(result.exception, ReplayExpired)
+            # Without a cursor the same code is not a replay problem; keep the stop.
+            with self.assertRaises(SetupRequired) as result:
+                await transport.ticket(None)
+            self.assertNotIsInstance(result.exception, ReplayPolicyChanged)
+
+    async def test_wake_policy_change_drops_the_cursor_and_reconnects_once_from_now(self):
+        from plugin.transport import ReplayPolicyChanged, listen
+        from unittest.mock import AsyncMock, MagicMock
+        # Inbox receivers sweep after subscribing; legacy receivers still reconnect.
+        for connection, wake in [({"credential_mode": "invitation"}, True), (None, False)]:
+            calls, order = [], []
+            async def ticket(cursor):
+                calls.append(cursor)
+                if cursor:
+                    raise ReplayPolicyChanged("changed")
+                order.append("ticket")
+                return {"url": "wss://example.invalid", "resume_cursor": "fresh"}
+            transport = MagicMock(connection=connection)
+            transport.ticket = ticket
+            state = MagicMock()
+            state.get.return_value = "old"
+            socket = MagicMock(subprotocol="ando.realtime.v1")
+            socket.__aiter__.return_value = iter([])
+            context = MagicMock()
+            context.__aenter__ = AsyncMock(return_value=socket)
+            context.__aexit__ = AsyncMock(return_value=False)
+            with patch("plugin.transport.websocket_connect", return_value=context):
+                await listen(transport, state, AsyncMock(), lambda: order.append("connected"),
+                             (lambda: order.append("wake")) if wake else None)
+            self.assertEqual(calls, ["old", None])
+            self.assertEqual(
+                [call.args for call in state.set.call_args_list],
+                [("cursor", None), ("cursor", "fresh")],
+            )
+            self.assertEqual(
+                order, ["ticket", "connected", "wake"] if wake else ["ticket", "connected"]
+            )
+
+    async def test_wake_policy_change_retries_without_a_cursor_only_once(self):
+        from plugin.transport import ReplayPolicyChanged, listen
+        from plugin.protocol import SetupRequired
+        from unittest.mock import AsyncMock, MagicMock
+        transport = MagicMock(connection={})
+        transport.ticket = AsyncMock(
+            side_effect=[ReplayPolicyChanged("changed"), SetupRequired("revoked")]
+        )
+        state = MagicMock()
+        state.get.return_value = "old"
+        with self.assertRaises(SetupRequired) as result:
+            await listen(transport, state, AsyncMock(), lambda: None, AsyncMock())
+        self.assertNotIsInstance(result.exception, ReplayPolicyChanged)
+        self.assertEqual(
+            [call.args for call in transport.ticket.await_args_list], [("old",), (None,)]
+        )
+
+    async def test_a_reconnectable_disconnect_returns_its_retry_delay(self):
+        from plugin.transport import receive_socket
+        from unittest.mock import AsyncMock, MagicMock
+        sent = []
+        socket = FakeSocket(
+            [{"type": "disconnect", "reason": "temporary_unavailable", "retry_after_seconds": 1}],
+            sent,
+        )
+        state = MagicMock()
+        self.assertEqual(await receive_socket(socket, state, AsyncMock()), 1)
+        state.set.assert_not_called()
+
     async def test_malformed_replay_error_keeps_explicit_stop(self):
         from plugin.transport import AndoTransport, ReplayExpired
         from plugin.protocol import SetupRequired
